@@ -5,9 +5,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, final
+from typing import TYPE_CHECKING, ClassVar, Literal, final
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeFloat,
+    PositiveInt,
+    model_validator,
+)
 
 from coreai_opt.config import (
     CompressionConfig,
@@ -52,6 +59,43 @@ class PATSchedule(BaseModel):
     def _compute_state(self, step_count: int) -> bool:
         """Return whether fake palettization should be active at the given step."""
         return step_count >= self.enable_fake_palettize
+
+
+class VectorKMeansConfig(BaseModel):
+    """K-means settings for vector palettization (``cluster_dim > 1``).
+
+    Scalar palettization (``cluster_dim == 1``) solves 1D k-means exactly and has no
+    restarts or iterations, so it does not use these settings.
+
+    Clustering runs on a CUDA GPU when available (flash-kmeans for unweighted
+    clustering, a batched torch loop for sensitivity-weighted clustering) and on CPU
+    with scikit-learn otherwise.
+
+    Attributes:
+        init (Literal["kmeans++", "greedy_kmeans++"]): Seeding method. ``"kmeans++"``
+            samples one candidate per seed; ``"greedy_kmeans++"`` samples several and
+            keeps the best, giving lower clustering error for a few times the seeding
+            cost. Default: ``"greedy_kmeans++"``.
+        n_init (int): Number of k-means restarts; the best result is kept for each
+            palettization block. More restarts cost proportionally more time.
+            Default: 5.
+        max_iter (int): Maximum Lloyd iterations per restart. Default: 300.
+        tol (float): Convergence tolerance. A block stops iterating once its clustering
+            error (inertia) improves by less than ``tol`` (relative) per iteration, or
+            once no assignment changes; with ``tol=0`` every restart runs until
+            assignments stop changing or ``max_iter`` is reached. Default: 1e-4.
+
+    Example:
+        >>> # Fast, approximate clustering, e.g. to check that export works.
+        >>> fast = VectorKMeansConfig(n_init=1, max_iter=1)
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    init: Literal["kmeans++", "greedy_kmeans++"] = "greedy_kmeans++"
+    n_init: PositiveInt = 5
+    max_iter: PositiveInt = 300
+    tol: NonNegativeFloat = 1e-4
 
 
 class OpKMeansPalettizerConfig(WeightOnlyOpValidationMixin, OpCompressionConfig[PalettizationSpec]):
@@ -168,6 +212,11 @@ class ModuleKMeansPalettizerConfig(
             If None, palettization is active immediately once training_mode()
             begins. Default: None.
 
+        vector_kmeans (VectorKMeansConfig | None): K-means settings for vector
+            palettization (``cluster_dim > 1``). Only valid when the module configures
+            at least one spec with ``cluster_dim > 1``. If None, vector palettization
+            uses the ``VectorKMeansConfig`` defaults. Default: None.
+
     Example:
         >>> config = ModuleKMeansPalettizerConfig()  # Uses defaults
         >>> # Or with custom settings:
@@ -189,6 +238,7 @@ class ModuleKMeansPalettizerConfig(
     enable_fast_kmeans_mode: bool = True
     rounding_precision: PositiveInt = 4
     pat_schedule: PATSchedule | None = None
+    vector_kmeans: VectorKMeansConfig | None = None
 
     # Namespace exposing built-in preset constructors.
     presets: ClassVar[_ModuleKMeansPalettizerConfigPresets]
@@ -210,6 +260,24 @@ class ModuleKMeansPalettizerConfig(
                     f"cluster_dim={spec.cluster_dim} for state '{state}'"
                 )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_vector_kmeans_has_vector_spec(self) -> ModuleKMeansPalettizerConfig:
+        """Validate that vector_kmeans is only set alongside a spec with cluster_dim > 1."""
+        if self.vector_kmeans is None:
+            return self
+
+        specs = [*(self.op_state_spec or {}).values(), *(self.module_state_spec or {}).values()]
+        for op_configs in (self.op_type_config, self.op_name_config):
+            for op_config in (op_configs or {}).values():
+                if op_config is not None:
+                    specs.extend((op_config.op_state_spec or {}).values())
+        if not any(spec is not None and spec.cluster_dim > 1 for spec in specs):
+            raise ValueError(
+                "vector_kmeans only applies to vector palettization, but no palettization "
+                "spec in this module config has cluster_dim > 1."
+            )
         return self
 
     def _get_fake_module_kwargs(self) -> dict:
