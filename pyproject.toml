@@ -67,7 +67,7 @@ coreml = [
 ]
 # Faster GPU clustering for vector palettization (cluster_dim > 1). Needs Triton, hence Linux only.
 flash-kmeans = [
-    "flash-kmeans>=0.3.1; sys_platform == 'linux'",
+    "flash-kmeans>=0.3.1; sys_platform=='linux'",
 ]
 [project.urls]
 Changelog = "https://github.com/apple/coreai-optimization/blob/main/CHANGELOG.md"
