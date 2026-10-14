@@ -270,7 +270,7 @@ Clustering runs where the hardware allows:
                   best of n_init restarts -> LUT
 ```
 
-- **GPU**: all vector tensors cluster on the GPU. PTP (data-free post-training palettization) runs its Lloyd iterations with [flash-kmeans](https://github.com/svg-project/flash-kmeans) when it is installed, which is much faster, and otherwise with a PyTorch loop. SKM (Sensitive K-Means, see `calibration_mode()`) always uses the PyTorch loop, because flash-kmeans has no per-point weights.
+- **GPU**: all vector tensors cluster on the GPU. PTP (data-free post-training palettization) runs its Lloyd iterations with [flash-kmeans](https://github.com/svg-project/flash-kmeans) (Yang et al., 2026, [arXiv:2603.09229](https://arxiv.org/abs/2603.09229)) when it is installed, which is much faster, and otherwise with a PyTorch loop. SKM (Sensitive K-Means, see `calibration_mode()`) always uses the PyTorch loop, because flash-kmeans has no per-point weights.
 - **CPU**: requires `scikit-learn`. As for scalar palettization, `prepare(num_workers=N)` clusters `N` layers in parallel.
 
 Without a GPU, `prepare()` raises an `ImportError` if scikit-learn is not installed. With a GPU, vector tensors run in the main process, one at a time, while the `num_workers` CPU workers handle the scalar tensors.

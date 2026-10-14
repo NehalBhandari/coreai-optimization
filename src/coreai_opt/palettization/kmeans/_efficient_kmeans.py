@@ -11,8 +11,9 @@ backend from the device:
 
 - **GPU**: batched k-means++ seeding (weight-proportional for sensitivity-weighted
   clustering), then Lloyd iterations with all blocks of the tensor in one batch: with
-  flash-kmeans (Triton) for unweighted clustering when it is installed, otherwise with a
-  batched torch loop, which also supports per-point weights.
+  flash-kmeans (Triton; "Flash-KMeans: Fast and Memory-Efficient Exact K-Means",
+  https://arxiv.org/abs/2603.09229) for unweighted clustering when it is installed,
+  otherwise with a batched torch loop, which also supports per-point weights.
 - **CPU**: scikit-learn ``kmeans_plusplus`` and ``KMeans``, one block at a time.
 
 On every backend a block stops iterating once its inertia improves by less than ``tol``
