@@ -14,7 +14,9 @@ backend from the device:
   flash-kmeans (Triton; "Flash-KMeans: Fast and Memory-Efficient Exact K-Means",
   https://arxiv.org/abs/2603.09229) for unweighted clustering when it is installed,
   otherwise with a batched torch loop, which also supports per-point weights.
-- **CPU**: scikit-learn ``kmeans_plusplus`` and ``KMeans``, one block at a time.
+- **CPU**: scikit-learn ``kmeans_plusplus`` and ``KMeans``, one block at a time. Without
+  scikit-learn, the batched torch loop runs on CPU instead, with a warning: it gives the
+  same results but is several times slower.
 
 On every backend a block stops iterating once its inertia improves by less than ``tol``
 (relative) per iteration, checked every few iterations, or once no assignment changes.
@@ -24,6 +26,8 @@ are always the exact (weighted) means of the final clusters.
 
 import functools
 import math
+import multiprocessing
+import warnings
 
 import numpy as np
 import torch
@@ -63,26 +67,41 @@ def vector_kmeans_backend(weighted: bool) -> str:
 
     Returns:
         str: On a CUDA GPU, ``"flash_kmeans"`` (unweighted, flash-kmeans installed) or
-        ``"torch"``; otherwise ``"sklearn"`` (CPU).
-
-    Raises:
-        ImportError: If there is no CUDA GPU and scikit-learn is not installed.
+        ``"torch"``. Without a GPU, ``"sklearn"``, or ``"torch"`` (on CPU, with a
+        one-time warning) if scikit-learn is not installed.
     """
     if torch.cuda.is_available():
         return "flash_kmeans" if not weighted and _flash_kmeans_available() else "torch"
     if _sklearn_available():
         return "sklearn"
-    raise ImportError(
-        "Vector palettization (cluster_dim > 1) without a CUDA GPU needs scikit-learn: "
-        "install 'scikit-learn'."
+    _warn_torch_cpu_fallback()
+    return "torch"
+
+
+@functools.cache
+def _warn_torch_cpu_fallback() -> None:
+    """Warn, once per process, that CPU clustering falls back to the torch backend."""
+    if multiprocessing.parent_process() is not None:
+        # A clustering worker: the palettizer already warned in the parent process.
+        return
+    warnings.warn(
+        "scikit-learn is not installed, so vector palettization (cluster_dim > 1) on CPU "
+        "uses the torch k-means backend. It gives the same results but is several times "
+        "slower; install 'scikit-learn' for faster CPU clustering.",
+        RuntimeWarning,
+        stacklevel=3,
     )
 
 
-def _n_local_trials(init: str, n_clusters: int) -> int:
-    """Candidates per k-means++ step: 1 for standard, scikit-learn's count for greedy."""
-    if init == "greedy_kmeans++":
+def _resolve_n_local_trials(n_local_trials: int | None, n_clusters: int) -> int:
+    """Candidates per k-means++ step; ``None`` means scikit-learn's default.
+
+    scikit-learn's ``kmeans_plusplus`` defaults to ``2 + int(log(n_clusters))``
+    (greedy k-means++); 1 is standard k-means++.
+    """
+    if n_local_trials is None:
         return 2 + int(math.log(n_clusters))
-    return 1
+    return n_local_trials
 
 
 def _tensor_seed(x: torch.Tensor) -> int:
@@ -295,18 +314,21 @@ def _lloyd_until_converged(
     return labels
 
 
-def _cluster_gpu(
+def _cluster_torch(
     x: torch.Tensor,
     weights: torch.Tensor | None,
     n_clusters: int,
-    init: str,
+    n_local_trials: int | None,
     n_init: int,
     max_iter: int,
     tol: float,
     use_flash: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Batched GPU k-means over ``(B, N, D)`` blocks; returns ``(centroids, labels)``."""
-    trials = _n_local_trials(init, n_clusters)
+    """Batched torch k-means over ``(B, N, D)`` blocks; returns ``(centroids, labels)``.
+
+    Runs on ``x``'s device: a CUDA GPU, or the CPU when scikit-learn is unavailable.
+    """
+    trials = _resolve_n_local_trials(n_local_trials, n_clusters)
     base_seed = _tensor_seed(x)
     best_labels, best_inertia = None, None
     for restart in range(n_init):
@@ -328,14 +350,15 @@ def _cluster_sklearn(
     x: torch.Tensor,
     weights: torch.Tensor | None,
     n_clusters: int,
-    init: str,
+    n_local_trials: int | None,
     n_init: int,
     max_iter: int,
     tol: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """scikit-learn k-means on one ``(N, D)`` block; returns ``(centroids, labels)``.
 
-    Seeds come from ``kmeans_plusplus`` (standard or greedy, matching the GPU paths), so
+    Seeds come from ``kmeans_plusplus`` with the same ``n_local_trials`` as the torch
+    paths (``KMeans`` itself does not expose it), so
     restarts are run here rather than through ``KMeans(n_init=...)``. Lloyd iterations
     run ``_CHECK_EVERY`` at a time with scikit-learn's own ``tol`` off, so the block stops
     on the same relative-inertia criterion as the GPU paths; scikit-learn still ends a
@@ -359,7 +382,7 @@ def _cluster_sklearn(
 
     points = x.float().numpy()
     w = None if weights is None else weights.float().numpy()
-    trials = _n_local_trials(init, n_clusters)
+    trials = _resolve_n_local_trials(n_local_trials, n_clusters)
     base_seed = _tensor_seed(x)
     best = None
     for restart in range(n_init):
@@ -383,7 +406,7 @@ def cluster_vectors(
     blocks: list[torch.Tensor],
     weights: list[torch.Tensor] | None,
     n_clusters: int,
-    init: str,
+    n_local_trials: int | None,
     n_init: int,
     max_iter: int,
     tol: float,
@@ -394,7 +417,8 @@ def cluster_vectors(
         blocks (list[torch.Tensor]): Per-block ``(N, D)`` vectors.
         weights (list[torch.Tensor] | None): Optional per-block ``(N,)`` point weights.
         n_clusters (int): Clusters per block. Must be ``<= N``.
-        init (str): ``"kmeans++"`` or ``"greedy_kmeans++"``.
+        n_local_trials (int | None): k-means++ candidates per seeding step; ``None``
+            means scikit-learn's default, ``2 + int(log(n_clusters))``.
         n_init (int): Restarts; the lowest-inertia one is kept per block.
         max_iter (int): Lloyd iteration cap per restart.
         tol (float): Convergence tolerance, see the module docstring.
@@ -402,9 +426,6 @@ def cluster_vectors(
     Returns:
         list[tuple[torch.Tensor, torch.Tensor]]: Per block, CPU ``(centroids, labels)``
         of shapes ``(n_clusters, D)`` and ``(N,)``.
-
-    Raises:
-        ImportError: If no k-means backend is available.
     """
     backend = vector_kmeans_backend(weighted=weights is not None)
     if backend == "sklearn":
@@ -413,7 +434,7 @@ def cluster_vectors(
                 block,
                 None if weights is None else weights[i],
                 n_clusters,
-                init,
+                n_local_trials,
                 n_init,
                 max_iter,
                 tol,
@@ -421,16 +442,25 @@ def cluster_vectors(
             for i, block in enumerate(blocks)
         ]
 
-    # One GPU batch per distinct block shape; all blocks of a tensor normally share one.
+    # One batch per distinct block shape; all blocks of a tensor normally share one. The
+    # torch backend runs on the GPU, or on the CPU when scikit-learn is unavailable.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     by_shape: dict[tuple[int, ...], list[int]] = {}
     for i, block in enumerate(blocks):
         by_shape.setdefault(tuple(block.shape), []).append(i)
     results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for idxs in by_shape.values():
-        x = torch.stack([blocks[i] for i in idxs]).cuda().float().contiguous()
-        w = None if weights is None else torch.stack([weights[i] for i in idxs]).cuda().float()
-        centroids, labels = _cluster_gpu(
-            x, w, n_clusters, init, n_init, max_iter, tol, use_flash=backend == "flash_kmeans"
+        x = torch.stack([blocks[i] for i in idxs]).to(device).float().contiguous()
+        w = None if weights is None else torch.stack([weights[i] for i in idxs]).to(device).float()
+        centroids, labels = _cluster_torch(
+            x,
+            w,
+            n_clusters,
+            n_local_trials,
+            n_init,
+            max_iter,
+            tol,
+            use_flash=backend == "flash_kmeans",
         )
         for j, i in enumerate(idxs):
             results[i] = (centroids[j].cpu(), labels[j].cpu())

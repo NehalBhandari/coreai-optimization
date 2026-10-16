@@ -33,7 +33,7 @@ from coreai_opt.quantization.spec import (
     QuantizationSpec,
 )
 
-from ._efficient_kmeans import cluster_vectors as _cluster_vectors
+from ._vector_kmeans import cluster_vectors as _cluster_vectors
 from .kmeans_support_mixins import _LinearPalettizationMixin
 from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
@@ -99,7 +99,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         sensitivities: torch.Tensor = None,
         enable_fast_kmeans_mode: bool = True,
         rounding_precision: int = 4,
-        vector_kmeans: VectorKMeansConfig | dict | None = None,
+        vector_kmeans_config: VectorKMeansConfig | dict | None = None,
         op_to_optimize: Callable | None = None,
         training_strategy_spec: TrainingStrategySpec | None = None,
     ):
@@ -114,7 +114,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         self.enable_fast_kmeans_mode = enable_fast_kmeans_mode
         self.rounding_precision = rounding_precision
         # Arrives as a dict when forwarded from ModuleKMeansPalettizerConfig.model_dump().
-        self.vector_kmeans = VectorKMeansConfig.model_validate(vector_kmeans or {})
+        self.vector_kmeans_config = VectorKMeansConfig.model_validate(vector_kmeans_config or {})
         self._sensitivities = sensitivities
 
         # Create LUT fake quantizer if LUT quantization is enabled.
@@ -872,12 +872,12 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 for block_sensitivity in block_sensitivities
             ]
 
-        settings = self.vector_kmeans
+        settings = self.vector_kmeans_config
         return _cluster_vectors(
             vectors,
             sample_weights,
             num_clusters,
-            init=settings.init,
+            n_local_trials=settings.n_local_trials,
             n_init=settings.n_init,
             max_iter=settings.max_iter,
             tol=settings.tol,

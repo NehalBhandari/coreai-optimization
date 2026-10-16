@@ -47,11 +47,11 @@ from coreai_opt.palettization.spec.fake_palettize import (
     _enable_fake_palett,
 )
 
-from ._efficient_kmeans import vector_kmeans_backend as _vector_kmeans_backend
 from ._prepare_for_export import (
     prepare_for_mil_export as _prepare_for_mil_export,
     prepare_for_mlir_export as _prepare_for_mlir_export,
 )
+from ._vector_kmeans import vector_kmeans_backend as _vector_kmeans_backend
 from .kmeans_fake_palettize import _KMeansFakePalettize
 from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
@@ -589,11 +589,8 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
         process, one after another, since a single GPU serializes them anyway, while scalar
         tensors run across ``num_workers`` worker processes at the same time. Without a GPU,
         all tensors run across the workers. Routing is per tensor, so the states of one
-        module can go different ways.
-
-        Raises:
-            ImportError: If vector palettization is configured without a CUDA GPU and
-                scikit-learn is not installed.
+        module can go different ways. Without a GPU, vector tensors use scikit-learn, or
+        the torch backend on CPU (with a warning) if scikit-learn is not installed.
         """
         fp_info = self._collect_fake_palett_info(to_cpu=False)
         if not fp_info:
@@ -612,7 +609,8 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 self._num_workers,
             )
         elif any(info.fp_module.cluster_dim > 1 for info in cpu_info):
-            _vector_kmeans_backend(weighted=False)  # raise now if scikit-learn is missing
+            # Warn once, before any workers start, if scikit-learn is missing.
+            _vector_kmeans_backend(weighted=False)
 
         if self._num_workers <= 1 or not cpu_info:
             self._calculate_centroids_sequential(fp_info)
