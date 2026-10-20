@@ -227,28 +227,47 @@ class TestGraphModeQuantizer:
     def test_finalize_torch_backend(
         self, simple_conv_linear_model, basic_config, simple_model_input
     ):
-        """Test finalize with _TORCH backend."""
+        """Torch finalize folds weight fake quantization and keeps activation fake quantization."""
         quantizer = Quantizer(simple_conv_linear_model, basic_config)
         prepared_model = quantizer.prepare((simple_model_input,))
+        expected_output = prepared_model(simple_model_input)
 
-        finalized_model = quantizer.finalize(prepared_model, ExportBackend._TORCH)
+        finalized_model = quantizer.finalize(prepared_model, ExportBackend.Torch)
 
         assert isinstance(finalized_model, torch.fx.GraphModule)
+        fake_quant_mods = [
+            m for m in finalized_model.modules() if isinstance(m, FakeQuantizeImplBase)
+        ]
+        assert fake_quant_mods, "activation fake quantization must be kept"
+        assert all(m.quantization_target != CompressionTargetTensor.WEIGHT for m in fake_quant_mods)
+        torch.testing.assert_close(finalized_model(simple_model_input), expected_output)
 
-        # Fake quantize layers should remain the same post finalize
-        prepared_fake_quant_nodes = get_fake_quant_nodes(prepared_model)
-        finalized_fake_quant_nodes = get_fake_quant_nodes(finalized_model)
+    def test_finalize_torch_backend_keeps_weight_read_directly(self, basic_config, caplog):
+        """A weight the graph also reads directly keeps its fake quantization unfolded."""
 
-        for prepared_node in prepared_fake_quant_nodes:
-            finalized_node = [
-                n for n in finalized_fake_quant_nodes if prepared_node.target == n.target
-            ][0]
+        class LinearPlusWeightSum(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = nn.Linear(8, 8)
 
-            assert prepared_node == finalized_node
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.linear(x) + self.linear.weight.sum()
 
-        # Test inference on finalized model
-        output = finalized_model(simple_model_input)
-        assert output.shape == (1, 10)
+        example_input = torch.randn(2, 8)
+        quantizer = Quantizer(LinearPlusWeightSum(), basic_config)
+        prepared_model = quantizer.prepare((example_input,))
+        expected_output = prepared_model(example_input)
+
+        with caplog.at_level(logging.WARNING):
+            finalized_model = quantizer.finalize(prepared_model, ExportBackend.Torch)
+
+        assert any(
+            isinstance(m, FakeQuantizeImplBase)
+            and m.quantization_target == CompressionTargetTensor.WEIGHT
+            for m in finalized_model.modules()
+        )
+        assert "keeping its fake quantization" in caplog.text
+        torch.testing.assert_close(finalized_model(example_input), expected_output)
 
     def test_finalize_after_deepcopy(
         self, simple_conv_linear_model, basic_config, simple_model_input
@@ -261,7 +280,7 @@ class TestGraphModeQuantizer:
 
         assert quantizer._is_model_prepared(copied_prepared_model)
 
-        finalized_model = quantizer.finalize(copied_prepared_model, ExportBackend._TORCH)
+        finalized_model = quantizer.finalize(copied_prepared_model, ExportBackend.Torch)
 
         assert isinstance(finalized_model, torch.fx.GraphModule)
         output = finalized_model(simple_model_input)
@@ -290,7 +309,7 @@ class TestGraphModeQuantizer:
         prepared_b = quantizer_b.prepare((simple_model_input,))
         prepared_b.load_state_dict(saved_state_dict)
 
-        finalized_b = quantizer_b.finalize(prepared_b, ExportBackend._TORCH)
+        finalized_b = quantizer_b.finalize(prepared_b, ExportBackend.Torch)
         actual_output = finalized_b(simple_model_input)
 
         assert torch.allclose(expected_output, actual_output)
@@ -484,7 +503,7 @@ class TestGraphModeQuantizer:
             assert f"Deepcopy failed for prepared model with error: {e}"
 
         # Step 3: Finalize
-        finalized_model = quantizer.finalize(backend=ExportBackend._TORCH)
+        finalized_model = quantizer.finalize(backend=ExportBackend.Torch)
         assert isinstance(finalized_model, torch.fx.GraphModule)
         # prepare model output before finalize should match output after finalize
         final_output = finalized_model(simple_model_input_3)
@@ -938,7 +957,7 @@ class TestAPIOrdering:
 
         # Should raise RuntimeError when trying to finalize unprepared model
         with pytest.raises(RuntimeError, match="Model must be prepared before finalization"):
-            quantizer.finalize(None, ExportBackend._TORCH)
+            quantizer.finalize(None, ExportBackend.Torch)
 
     def test_calibration_mode_before_prepare(self, simple_conv_linear_model, basic_config):
         """Test calling calibration_mode before prepare should raise error."""
@@ -1402,7 +1421,7 @@ class TestGraphModeHalfPrecisionSupport:
     @pytest.mark.parametrize(
         "backend",
         [
-            pytest.param(ExportBackend._TORCH, id="torch"),
+            pytest.param(ExportBackend.Torch, id="torch"),
             pytest.param(ExportBackend.CoreAI, id="coreai"),
             pytest.param(ExportBackend.CoreML, id="coreml"),
         ],
@@ -1429,7 +1448,7 @@ class TestGraphModeHalfPrecisionSupport:
 
         finalized_model = quantizer.finalize(backend=backend)
         if model_dtype == torch.float32 or backend in [
-            ExportBackend._TORCH,
+            ExportBackend.Torch,
             ExportBackend.CoreAI,
         ]:
             output = finalized_model(example_input)
@@ -1542,7 +1561,7 @@ class TestPreservedAttributes:
     @pytest.mark.parametrize(
         "backend",
         [
-            pytest.param(ExportBackend._TORCH, id="torch"),
+            pytest.param(ExportBackend.Torch, id="torch"),
             pytest.param(ExportBackend.CoreAI, id="coreai"),
             pytest.param(ExportBackend.CoreML, id="coreml"),
         ],

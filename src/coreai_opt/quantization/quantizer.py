@@ -417,7 +417,7 @@ class Quantizer(_BaseQuantizer):
         ``EagerActivationExportHandler`` in eager mode.
 
         """
-        if backend == ExportBackend._TORCH:
+        if backend == ExportBackend.Torch:
             return
         model_to_check = model if model is not None else self._model
         stateless_fq_names = [
@@ -432,7 +432,7 @@ class Quantizer(_BaseQuantizer):
                 f"backend={backend} does not yet support qparams calculators that "
                 f"recompute every forward (e.g. dynamic quantization). "
                 f"Affected FakeQuantize modules: {stateless_fq_names}. Use "
-                f"backend=ExportBackend._TORCH for torch-only inference."
+                f"backend=ExportBackend.Torch for torch-only inference."
             )
 
     def finalize(
@@ -445,8 +445,6 @@ class Quantizer(_BaseQuantizer):
         """Convert quantized model to backend-specific representations.
 
         Converts fake quantization modules into backend-specific quantization ops.
-        Only call ``finalize`` when exporting to a target backend. For torch-based evaluation, use
-        the model returned by ``prepare()`` directly rather than calling ``finalize``.
 
         Backend-specific processing:
 
@@ -454,12 +452,15 @@ class Quantizer(_BaseQuantizer):
           with Core AI specific PyTorch custom ops.
         - CoreML: Prepares for CoreML export by registering compression metadata
           as buffers and removes fake quantization modules.
+        - Torch: Prepares for fast torch inference (e.g. running evals) by folding
+          weight fake quantization into dense weights. Activation fake quantization
+          is kept.
 
         Args:
             model: Optional model to finalize. If None, uses the internal
                 prepared model.
             backend: Target export backend for the quantized model. Supports
-                CoreAI (default), CoreML, and _TORCH backends.
+                CoreAI (default), CoreML, and Torch backends.
             mmap_dir (str | None): If provided, serialize finalized quantized
                 weights to safetensors files under this directory and re-load
                 them via mmap, one file per weight. Supported in both execution

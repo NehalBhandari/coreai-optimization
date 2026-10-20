@@ -89,6 +89,7 @@ from ._prepare_for_export import (
     _move_cache_dequant_to_output,
     prepare_for_mil_export,
     prepare_for_mlir_export,
+    prepare_for_torch_inference,
 )
 from ._qspec_reconcile import (
     _AnnotationContext,
@@ -1118,16 +1119,14 @@ class GraphQuantizer(_BaseQuantizer):
 
         This method converts the prepared model with fake quantization modules to a
         final quantized model with actual quantized operations, ready for deployment
-        to the target export backend.
-
-        Only call ``finalize`` when exporting to a target backend. For torch-based
-        evaluation, use the model returned by ``prepare()`` directly rather than
-        calling ``finalize``.
+        to the target export backend. For ``backend=ExportBackend.Torch``, weight fake
+        quantization is folded into dense weights and activation fake quantization
+        is kept.
 
         Args:
             model: Optional model to finalize. If None, uses the internal prepared model.
-            backend: Target export backend for the quantized model.
-                Supports CoreAI (default) and CoreML.
+            backend: Target backend for the quantized model.
+                Supports CoreAI (default), CoreML and Torch.
             mmap_dir (str | None): If provided, each quantized weight is serialized to
                 its own safetensors file under this directory and re-read mmap-backed.
                 Only supported with the CoreAI backend.
@@ -1181,11 +1180,11 @@ class GraphQuantizer(_BaseQuantizer):
 
         # Backend-specific processing
         match backend:
-            case ExportBackend._TORCH:
+            case ExportBackend.Torch:
                 # KV-cache quantization is a no-op for the torch backend: the
                 # fake-quant observers on the cache op input stay in the graph.
                 # Cache-buffer retyping only happens on the CoreAI backend.
-                pass
+                finalized_model = prepare_for_torch_inference(finalized_model)
 
             case ExportBackend.CoreML:
                 if self._config.kv_cache_quant_configs:

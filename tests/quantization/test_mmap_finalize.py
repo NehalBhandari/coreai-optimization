@@ -150,7 +150,7 @@ def test_finalize_mmap_preserves_weight_sharing(
 
 
 @pytest.mark.parametrize("execution_mode", MODES)
-@pytest.mark.parametrize("backend", [ExportBackend.CoreML, ExportBackend._TORCH])
+@pytest.mark.parametrize("backend", [ExportBackend.CoreML, ExportBackend.Torch])
 def test_finalize_mmap_rejects_non_coreai_backend(
     execution_mode, backend, simple_linear_model, simple_linear_model_input, tmp_path
 ):

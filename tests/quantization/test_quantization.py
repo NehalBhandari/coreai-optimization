@@ -492,7 +492,7 @@ class TestDynamicActivationQuantization:
         [
             (ExportBackend.CoreAI, False),
             (ExportBackend.CoreML, False),
-            (ExportBackend._TORCH, True),
+            (ExportBackend.Torch, True),
         ],
     )
     def test_finalize_rejects_dynamic_for_non_torch_backends(

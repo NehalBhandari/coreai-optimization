@@ -129,10 +129,12 @@ class _BaseModelCompressor(ABC):
         For example, for quantization:
         - For CoreAI backend (default), custom ops will be inserted.
         - For CoreML, compression metadata will be inserted as buffers in the model.
+        - For Torch, weight compression is folded into dense weights for fast torch
+          inference.
 
         Args:
             model: Optional model to finalize. If None, uses self._model
-            backend: Target export backend (CoreAI, CoreML)
+            backend: Target backend (CoreAI, CoreML, Torch)
             mmap_dir (str | None): If provided, serialize finalized compressed
                 weights to safetensors files under this directory and re-load
                 them via mmap, so large models can be finalized without holding

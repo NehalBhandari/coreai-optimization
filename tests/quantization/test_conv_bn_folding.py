@@ -431,7 +431,7 @@ def test_conv_bn_folding_numerical_correctness(
     Export backend logic is verified separately in
     test_conv_bn_folding_export_verification.
     """
-    backend = ExportBackend._TORCH
+    backend = ExportBackend.Torch
     # Create model and re-initialize BNs with non-trivial params so the fold
     # actually bakes a non-identity scale into conv weights.
     model = model_config.model_cls(**model_config.model_kwargs)
