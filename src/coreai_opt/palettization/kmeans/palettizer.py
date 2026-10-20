@@ -604,13 +604,13 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 "Clustering %d vector-palettized tensors on the GPU (unweighted Lloyd "
                 "iterations: %s) and %d tensors on CPU (num_workers=%d)",
                 len(gpu_info),
-                _vector_kmeans_backend(weighted=False),
+                _vector_kmeans_backend(has_sensitivities=False),
                 len(cpu_info),
                 self._num_workers,
             )
         elif any(info.fp_module.cluster_dim > 1 for info in cpu_info):
             # Warn once, before any workers start, if scikit-learn is missing.
-            _vector_kmeans_backend(weighted=False)
+            _vector_kmeans_backend(has_sensitivities=False)
 
         if self._num_workers <= 1 or not cpu_info:
             self._calculate_centroids_sequential(fp_info)

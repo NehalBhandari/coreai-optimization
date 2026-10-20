@@ -93,11 +93,11 @@ class TestBatchedKMeansPlusPlusInit:
         greedy = _potential(x, ek.batched_kmeanspp_init(x, 16, 8, gen))
         assert greedy.mean() < standard.mean()
 
-    def test_zero_weight_points_are_never_seeds(self):
+    def test_zero_sensitivity_points_are_never_seeds(self):
         x = torch.randn(2, 200, 2, generator=torch.Generator().manual_seed(0))
-        weights = torch.zeros(2, 200)
-        weights[:, :50] = 1.0
-        seeds = ek.batched_kmeanspp_init(x, 16, 3, torch.Generator().manual_seed(0), weights)
+        sensitivities = torch.zeros(2, 200)
+        sensitivities[:, :50] = 1.0
+        seeds = ek.batched_kmeanspp_init(x, 16, 3, torch.Generator().manual_seed(0), sensitivities)
         for b in range(2):
             idx = torch.cdist(seeds[b], x[b]).argmin(-1)
             assert (idx < 50).all()
@@ -137,12 +137,14 @@ class TestLloydUntilConverged:
     """Uses the weighted torch Lloyd loop, which also runs on CPU."""
 
     def _run(self, x, max_iter, tol):
-        weights = torch.ones(x.shape[:2])
-        seeds = ek.batched_kmeanspp_init(x, 8, 1, torch.Generator().manual_seed(0), weights)
+        sensitivities = torch.ones(x.shape[:2])
+        seeds = ek.batched_kmeanspp_init(x, 8, 1, torch.Generator().manual_seed(0), sensitivities)
         with mock.patch.object(ek, "_torch_lloyd_steps", wraps=ek._torch_lloyd_steps) as steps:
-            labels = ek._lloyd_until_converged(x, seeds, weights, max_iter, tol, use_flash=False)
+            labels = ek._lloyd_until_converged(
+                x, seeds, sensitivities, max_iter, tol, use_flash=False
+            )
         iterations = sum(call.args[2] for call in steps.call_args_list)
-        return labels, weights, iterations
+        return labels, sensitivities, iterations
 
     def test_stops_early_on_easy_data(self):
         x, _ = _clustered_blocks(num_blocks=4, points_per_center=50, n_clusters=8)
@@ -169,10 +171,10 @@ class TestLloydUntilConverged:
 
     def test_more_iterations_never_raise_inertia(self):
         x = torch.randn(4, 400, 2, generator=torch.Generator().manual_seed(0))
-        short, weights, _ = self._run(x, max_iter=2, tol=0.0)
+        short, sensitivities, _ = self._run(x, max_iter=2, tol=0.0)
         long, _, _ = self._run(x, max_iter=40, tol=0.0)
-        short_inertia = ek._block_inertia(x, short, 8, weights)
-        long_inertia = ek._block_inertia(x, long, 8, weights)
+        short_inertia = ek._block_inertia(x, short, 8, sensitivities)
+        long_inertia = ek._block_inertia(x, long, 8, sensitivities)
         assert (long_inertia <= short_inertia + 1e-5).all()
 
 
@@ -187,7 +189,7 @@ class TestBackendSelection:
         return configure
 
     @pytest.mark.parametrize(
-        ("cuda", "flash", "sklearn", "weighted", "expected"),
+        ("cuda", "flash", "sklearn", "has_sensitivities", "expected"),
         [
             (True, True, True, False, "flash_kmeans"),
             (True, True, True, True, "torch"),
@@ -200,20 +202,20 @@ class TestBackendSelection:
         ],
     )
     def test_selects_backend_from_the_machine(
-        self, machine, cuda, flash, sklearn, weighted, expected
+        self, machine, cuda, flash, sklearn, has_sensitivities, expected
     ):
         machine(cuda=cuda, flash=flash, sklearn=sklearn)
         ek._warn_torch_cpu_fallback.cache_clear()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            assert ek.vector_kmeans_backend(weighted) == expected
+            assert ek.vector_kmeans_backend(has_sensitivities) == expected
 
     def test_cpu_without_sklearn_falls_back_to_torch_and_warns_once(self, machine):
         machine(cuda=False, flash=False, sklearn=False)
         ek._warn_torch_cpu_fallback.cache_clear()
         with pytest.warns(RuntimeWarning, match="scikit-learn is not installed") as record:
-            assert ek.vector_kmeans_backend(weighted=False) == "torch"
-            assert ek.vector_kmeans_backend(weighted=True) == "torch"
+            assert ek.vector_kmeans_backend(has_sensitivities=False) == "torch"
+            assert ek.vector_kmeans_backend(has_sensitivities=True) == "torch"
         assert len(record) == 1
 
 
@@ -235,11 +237,11 @@ class TestTorchCpuFallback:
 
     def test_weighted_centroids_are_weighted_means_on_cpu(self):
         x = torch.randn(1, 300, 2, generator=torch.Generator().manual_seed(0))
-        weights = torch.rand(1, 300, generator=torch.Generator().manual_seed(1)) + 0.1
+        sensitivities = torch.rand(1, 300, generator=torch.Generator().manual_seed(1)) + 0.1
         ((centroids, labels),) = ek.cluster_vectors(
-            list(x), list(weights), 8, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
+            list(x), list(sensitivities), 8, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
         )
-        expected = ek.batched_cluster_avg(x, labels.unsqueeze(0), 8, weights)[0]
+        expected = ek.batched_cluster_avg(x, labels.unsqueeze(0), 8, sensitivities)[0]
         torch.testing.assert_close(centroids, expected)
 
 
@@ -249,10 +251,10 @@ class TestSklearnPath:
         pytest.importorskip("sklearn")
         monkeypatch.setattr(ek.torch.cuda, "is_available", lambda: False)
 
-    def _cluster(self, blocks, weights=None, **settings):
+    def _cluster(self, blocks, sensitivities=None, **settings):
         kwargs = {"n_local_trials": None, "n_init": 2, "max_iter": 300, "tol": 1e-4}
         kwargs.update(settings)
-        return ek.cluster_vectors(blocks, weights, 8, **kwargs)
+        return ek.cluster_vectors(blocks, sensitivities, 8, **kwargs)
 
     def test_recovers_well_separated_clusters(self):
         x, centers = _clustered_blocks(num_blocks=3, points_per_center=30, n_clusters=8)
@@ -270,9 +272,9 @@ class TestSklearnPath:
 
     def test_weighted_centroids_are_weighted_means(self):
         x = torch.randn(1, 300, 2, generator=torch.Generator().manual_seed(0))
-        weights = torch.rand(1, 300, generator=torch.Generator().manual_seed(1)) + 0.1
-        ((centroids, labels),) = self._cluster(list(x), list(weights))
-        expected = ek.batched_cluster_avg(x, labels.unsqueeze(0), 8, weights)[0]
+        sensitivities = torch.rand(1, 300, generator=torch.Generator().manual_seed(1)) + 0.1
+        ((centroids, labels),) = self._cluster(list(x), list(sensitivities))
+        expected = ek.batched_cluster_avg(x, labels.unsqueeze(0), 8, sensitivities)[0]
         torch.testing.assert_close(centroids, expected)
 
     def test_single_restart_single_iteration(self):
@@ -494,7 +496,7 @@ class TestGPUPaths:
         pytest.importorskip("sklearn")
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
         settings = {"n_local_trials": None, "n_init": 2, "max_iter": 300, "tol": 1e-4}
-        assert ek.vector_kmeans_backend(weighted=False) == "flash_kmeans"
+        assert ek.vector_kmeans_backend(has_sensitivities=False) == "flash_kmeans"
         gpu = ek.cluster_vectors(list(x), None, 16, **settings)
         with mock.patch.object(ek.torch.cuda, "is_available", return_value=False):
             cpu = ek.cluster_vectors(list(x), None, 16, **settings)
@@ -504,7 +506,7 @@ class TestGPUPaths:
 
     def test_unweighted_without_flash_kmeans_stays_on_the_gpu(self, monkeypatch):
         monkeypatch.setattr(ek, "_flash_kmeans_available", lambda: False)
-        assert ek.vector_kmeans_backend(weighted=False) == "torch"
+        assert ek.vector_kmeans_backend(has_sensitivities=False) == "torch"
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
         results = ek.cluster_vectors(
             list(x), None, 16, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
@@ -514,13 +516,13 @@ class TestGPUPaths:
 
     def test_weighted_gpu_path_recovers_clusters(self):
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
-        weights = torch.rand(x.shape[:2]) + 0.5
+        sensitivities = torch.rand(x.shape[:2]) + 0.5
         results = ek.cluster_vectors(
-            list(x), list(weights), 16, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
+            list(x), list(sensitivities), 16, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
         )
-        for (centroids, labels), block, w, true_centers in zip(
-            results, x, weights, centers, strict=True
+        for (centroids, labels), block, s, true_centers in zip(
+            results, x, sensitivities, centers, strict=True
         ):
             assert torch.cdist(true_centers, centroids).min(-1).values.max() < 0.1
-            expected = ek.batched_cluster_avg(block[None], labels[None], 16, w[None])[0]
+            expected = ek.batched_cluster_avg(block[None], labels[None], 16, s[None])[0]
             torch.testing.assert_close(centroids, expected)

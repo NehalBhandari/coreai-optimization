@@ -865,9 +865,9 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         num_clusters = min(len(vectors[0]), 2**self.n_bits)
 
         # Per-vector importance: sensitivities summed along cluster_dim.
-        sample_weights = None
+        vector_sensitivities = None
         if block_sensitivities[0] is not None:
-            sample_weights = [
+            vector_sensitivities = [
                 self._vectorize_block(block_sensitivity).sum(dim=-1)
                 for block_sensitivity in block_sensitivities
             ]
@@ -875,7 +875,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         settings = self.vector_kmeans_config
         return _cluster_vectors(
             vectors,
-            sample_weights,
+            vector_sensitivities,
             num_clusters,
             n_local_trials=settings.n_local_trials,
             n_init=settings.n_init,
