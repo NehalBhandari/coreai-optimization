@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Literal, final
+from typing import TYPE_CHECKING, ClassVar, final
 
 from pydantic import (
     BaseModel,
@@ -64,35 +64,55 @@ class PATSchedule(BaseModel):
 class VectorKMeansConfig(BaseModel):
     """K-means settings for vector palettization (``cluster_dim > 1``).
 
-    Scalar palettization (``cluster_dim == 1``) solves 1D k-means exactly and has no
-    restarts or iterations, so it does not use these settings.
+    Vector palettization clusters each palettization block's ``cluster_dim``-long weight
+    vectors into ``2 ** n_bits`` centroids with k-means. Each run seeds the
+    centroids with k-means++, then runs Lloyd iterations (assign every vector to its
+    nearest centroid, move each centroid to the mean of its vectors) until the block
+    converges. These settings trade clustering quality for speed.
 
-    Clustering runs on a CUDA GPU when available (flash-kmeans for unweighted
-    clustering, a batched torch loop for sensitivity-weighted clustering) and on CPU
-    with scikit-learn otherwise.
+    Where clustering runs:
+
+    - **CUDA GPU**: all blocks of a weight tensor are clustered together in one batch.
+      Unweighted clustering (post-training palettization) uses flash-kmeans for the
+      Lloyd iterations when it is installed, and otherwise a batched PyTorch loop.
+      Sensitivity-weighted clustering (``calibration_mode()``) always uses the PyTorch
+      loop, because flash-kmeans has no per-point weights.
+    - **CPU**: scikit-learn, one block at a time. If scikit-learn is not installed, the
+      batched PyTorch loop runs on CPU instead and a warning is issued; it gives the
+      same results but is several times slower.
+
+    Every backend uses the same seeding, the same stopping rule, and a seed derived
+    from each tensor's contents, so results are reproducible across runs.
 
     Attributes:
-        init (Literal["kmeans++", "greedy_kmeans++"]): Seeding method. ``"kmeans++"``
-            samples one candidate per seed; ``"greedy_kmeans++"`` samples several and
-            keeps the best, giving lower clustering error for a few times the seeding
-            cost. Default: ``"greedy_kmeans++"``.
-        n_init (int): Number of k-means restarts; the best result is kept for each
-            palettization block. More restarts cost proportionally more time.
-            Default: 5.
-        max_iter (int): Maximum Lloyd iterations per restart. Default: 300.
+        n_local_trials (int | None): Number of candidate centroids sampled at each
+            k-means++ seeding step. The candidate that most reduces the clustering
+            error is kept. ``1`` is standard k-means++. Larger values ("greedy"
+            k-means++) usually give lower clustering error, and seeding time grows
+            roughly in proportion. ``None`` uses scikit-learn's default,
+            ``2 + int(log(n_clusters))``. Default: ``None``.
+        n_init (int): How many times k-means is run from scratch on each block, each
+            time starting from a different set of initial centroids. Because the result
+            depends on where k-means starts, more runs make it likelier to find a good
+            one; the run with the lowest clustering error is kept. Time grows linearly
+            with ``n_init``. Default: 5.
+        max_iter (int): Maximum number of Lloyd iterations per run. Default: 300.
         tol (float): Convergence tolerance. A block stops iterating once its clustering
-            error (inertia) improves by less than ``tol`` (relative) per iteration, or
-            once no assignment changes; with ``tol=0`` every restart runs until
-            assignments stop changing or ``max_iter`` is reached. Default: 1e-4.
+            error (inertia) improves by less than ``tol``, or when ``max_iter`` is
+            reached. Default: ``1e-4``.
 
     Example:
-        >>> # Fast, approximate clustering, e.g. to check that export works.
-        >>> fast = VectorKMeansConfig(n_init=1, max_iter=1)
+        >>> # Defaults: greedy k-means++, 5 runs, convergence-based stopping.
+        >>> default = VectorKMeansConfig()
+        >>> # Fast, approximate clustering, e.g. to check that a model exports.
+        >>> fast = VectorKMeansConfig(n_local_trials=1, n_init=1, max_iter=1)
+        >>> # More runs for a sensitive model.
+        >>> thorough = VectorKMeansConfig(n_init=12)
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    init: Literal["kmeans++", "greedy_kmeans++"] = "greedy_kmeans++"
+    n_local_trials: PositiveInt | None = None
     n_init: PositiveInt = 5
     max_iter: PositiveInt = 300
     tol: NonNegativeFloat = 1e-4
@@ -212,7 +232,7 @@ class ModuleKMeansPalettizerConfig(
             If None, palettization is active immediately once training_mode()
             begins. Default: None.
 
-        vector_kmeans (VectorKMeansConfig | None): K-means settings for vector
+        vector_kmeans_config (VectorKMeansConfig | None): K-means settings for vector
             palettization (``cluster_dim > 1``). Only valid when the module configures
             at least one spec with ``cluster_dim > 1``. If None, vector palettization
             uses the ``VectorKMeansConfig`` defaults. Default: None.
@@ -238,7 +258,7 @@ class ModuleKMeansPalettizerConfig(
     enable_fast_kmeans_mode: bool = True
     rounding_precision: PositiveInt = 4
     pat_schedule: PATSchedule | None = None
-    vector_kmeans: VectorKMeansConfig | None = None
+    vector_kmeans_config: VectorKMeansConfig | None = None
 
     # Namespace exposing built-in preset constructors.
     presets: ClassVar[_ModuleKMeansPalettizerConfigPresets]
@@ -264,8 +284,8 @@ class ModuleKMeansPalettizerConfig(
 
     @model_validator(mode="after")
     def validate_vector_kmeans_has_vector_spec(self) -> ModuleKMeansPalettizerConfig:
-        """Validate that vector_kmeans is only set alongside a spec with cluster_dim > 1."""
-        if self.vector_kmeans is None:
+        """Validate that vector_kmeans_config is only set alongside a spec with cluster_dim > 1."""
+        if self.vector_kmeans_config is None:
             return self
 
         specs = [*(self.op_state_spec or {}).values(), *(self.module_state_spec or {}).values()]
@@ -275,7 +295,7 @@ class ModuleKMeansPalettizerConfig(
                     specs.extend((op_config.op_state_spec or {}).values())
         if not any(spec is not None and spec.cluster_dim > 1 for spec in specs):
             raise ValueError(
-                "vector_kmeans only applies to vector palettization, but no palettization "
+                "vector_kmeans_config only applies to vector palettization, but no palettization "
                 "spec in this module config has cluster_dim > 1."
             )
         return self

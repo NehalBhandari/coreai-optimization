@@ -13,6 +13,7 @@ the flash-kmeans and weighted GPU paths.
 
 from __future__ import annotations
 
+import warnings
 from unittest import mock
 
 import pytest
@@ -26,7 +27,7 @@ from coreai_opt.palettization import (
     ModuleKMeansPalettizerConfig,
 )
 from coreai_opt.palettization.config import OpKMeansPalettizerConfig, VectorKMeansConfig
-from coreai_opt.palettization.kmeans import _efficient_kmeans as ek, palettizer as palettizer_module
+from coreai_opt.palettization.kmeans import _vector_kmeans as ek, palettizer as palettizer_module
 from coreai_opt.palettization.kmeans.kmeans_fake_palettize import _KMeansFakePalettize
 from coreai_opt.palettization.spec import (
     PalettizationSpec,
@@ -194,18 +195,52 @@ class TestBackendSelection:
             (True, False, False, True, "torch"),
             (False, True, True, False, "sklearn"),
             (False, False, True, True, "sklearn"),
+            (False, False, False, False, "torch"),
+            (False, True, False, True, "torch"),
         ],
     )
     def test_selects_backend_from_the_machine(
         self, machine, cuda, flash, sklearn, weighted, expected
     ):
         machine(cuda=cuda, flash=flash, sklearn=sklearn)
-        assert ek.vector_kmeans_backend(weighted) == expected
+        ek._warn_torch_cpu_fallback.cache_clear()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            assert ek.vector_kmeans_backend(weighted) == expected
 
-    def test_raises_when_no_backend_is_available(self, machine):
+    def test_cpu_without_sklearn_falls_back_to_torch_and_warns_once(self, machine):
         machine(cuda=False, flash=False, sklearn=False)
-        with pytest.raises(ImportError, match="scikit-learn"):
-            ek.vector_kmeans_backend(weighted=False)
+        ek._warn_torch_cpu_fallback.cache_clear()
+        with pytest.warns(RuntimeWarning, match="scikit-learn is not installed") as record:
+            assert ek.vector_kmeans_backend(weighted=False) == "torch"
+            assert ek.vector_kmeans_backend(weighted=True) == "torch"
+        assert len(record) == 1
+
+
+class TestTorchCpuFallback:
+    @pytest.fixture(autouse=True)
+    def cpu_without_sklearn(self, monkeypatch):
+        monkeypatch.setattr(ek.torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(ek, "_sklearn_available", lambda: False)
+        monkeypatch.setattr(ek, "_warn_torch_cpu_fallback", lambda: None)
+
+    def test_recovers_well_separated_clusters_on_cpu(self):
+        x, centers = _clustered_blocks(num_blocks=3, points_per_center=30, n_clusters=8)
+        results = ek.cluster_vectors(
+            list(x), None, 8, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
+        )
+        for (centroids, labels), block, true_centers in zip(results, x, centers, strict=True):
+            assert centroids.device.type == "cpu" and labels.shape == (block.shape[0],)
+            assert torch.cdist(true_centers, centroids).min(-1).values.max() < 0.1
+
+    def test_weighted_centroids_are_weighted_means_on_cpu(self):
+        x = torch.randn(1, 300, 2, generator=torch.Generator().manual_seed(0))
+        weights = torch.rand(1, 300, generator=torch.Generator().manual_seed(1)) + 0.1
+        ((centroids, labels),) = ek.cluster_vectors(
+            list(x), list(weights), 8, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
+        )
+        expected = ek.batched_cluster_avg(x, labels.unsqueeze(0), 8, weights)[0]
+        torch.testing.assert_close(centroids, expected)
 
 
 class TestSklearnPath:
@@ -215,7 +250,7 @@ class TestSklearnPath:
         monkeypatch.setattr(ek.torch.cuda, "is_available", lambda: False)
 
     def _cluster(self, blocks, weights=None, **settings):
-        kwargs = {"init": "greedy_kmeans++", "n_init": 2, "max_iter": 300, "tol": 1e-4}
+        kwargs = {"n_local_trials": None, "n_init": 2, "max_iter": 300, "tol": 1e-4}
         kwargs.update(settings)
         return ek.cluster_vectors(blocks, weights, 8, **kwargs)
 
@@ -242,22 +277,29 @@ class TestSklearnPath:
 
     def test_single_restart_single_iteration(self):
         x = torch.randn(2, 300, 2, generator=torch.Generator().manual_seed(0))
-        results = self._cluster(list(x), init="kmeans++", n_init=1, max_iter=1)
+        results = self._cluster(list(x), n_local_trials=1, n_init=1, max_iter=1)
         assert all(labels.max() < 8 for _, labels in results)
 
 
 class TestVectorKMeansConfig:
     def test_defaults(self):
         config = VectorKMeansConfig()
-        assert (config.init, config.n_init, config.max_iter, config.tol) == (
-            "greedy_kmeans++",
+        assert (config.n_local_trials, config.n_init, config.max_iter, config.tol) == (
+            None,
             5,
             300,
             1e-4,
         )
 
     @pytest.mark.parametrize(
-        "bad", [{"n_init": 0}, {"max_iter": 0}, {"tol": -1.0}, {"init": "random"}]
+        "bad",
+        [
+            {"n_init": 0},
+            {"max_iter": 0},
+            {"tol": -1.0},
+            {"n_local_trials": 0},
+            {"init": "kmeans++"},
+        ],
     )
     def test_rejects_invalid_values(self, bad):
         with pytest.raises(ValidationError):
@@ -267,7 +309,7 @@ class TestVectorKMeansConfig:
         with pytest.raises(ValidationError, match="cluster_dim > 1"):
             ModuleKMeansPalettizerConfig(
                 op_state_spec={"weight": PalettizationSpec(n_bits=4)},
-                vector_kmeans=VectorKMeansConfig(),
+                vector_kmeans_config=VectorKMeansConfig(),
             )
 
     def test_accepts_a_vector_spec_anywhere_in_the_module_config(self):
@@ -277,7 +319,7 @@ class TestVectorKMeansConfig:
                 "linear": OpKMeansPalettizerConfig(op_state_spec={"weight": _vector_spec()})
             },
             enable_fast_kmeans_mode=False,
-            vector_kmeans=VectorKMeansConfig(n_init=2),
+            vector_kmeans_config=VectorKMeansConfig(n_init=2),
         )
 
     def test_parses_from_a_dict(self):
@@ -287,13 +329,13 @@ class TestVectorKMeansConfig:
                     "global_config": {
                         "enable_fast_kmeans_mode": False,
                         "op_state_spec": {"weight": {"n_bits": 2, "cluster_dim": 2}},
-                        "vector_kmeans": {"n_init": 1, "max_iter": 1, "init": "kmeans++"},
+                        "vector_kmeans_config": {"n_init": 1, "max_iter": 1, "n_local_trials": 1},
                     }
                 }
             }
         )
-        assert config.global_config.vector_kmeans == VectorKMeansConfig(
-            n_init=1, max_iter=1, init="kmeans++"
+        assert config.global_config.vector_kmeans_config == VectorKMeansConfig(
+            n_init=1, max_iter=1, n_local_trials=1
         )
 
     def test_unset_gives_the_fake_palettize_module_the_defaults(self):
@@ -305,7 +347,7 @@ class TestVectorKMeansConfig:
             enable_per_channel_scale=False,
             enable_fast_kmeans_mode=False,
         )
-        assert fp.vector_kmeans == VectorKMeansConfig()
+        assert fp.vector_kmeans_config == VectorKMeansConfig()
 
 
 class TestPalettizerPlumbing:
@@ -314,17 +356,17 @@ class TestPalettizerPlumbing:
         pytest.importorskip("sklearn")
         monkeypatch.setattr(ek.torch.cuda, "is_available", lambda: False)
 
-    def _config(self, vector_kmeans=None, spec=None) -> KMeansPalettizerConfig:
+    def _config(self, vector_kmeans_config=None, spec=None) -> KMeansPalettizerConfig:
         return KMeansPalettizerConfig(
             global_config=ModuleKMeansPalettizerConfig(
                 op_state_spec={"weight": spec or _vector_spec()},
                 enable_fast_kmeans_mode=False,
-                vector_kmeans=vector_kmeans,
+                vector_kmeans_config=vector_kmeans_config,
             )
         )
 
     def test_settings_reach_the_k_means_backend(self):
-        settings = VectorKMeansConfig(init="kmeans++", n_init=2, max_iter=7, tol=0.0)
+        settings = VectorKMeansConfig(n_local_trials=1, n_init=2, max_iter=7, tol=0.0)
         model = _Linear()
         with mock.patch(
             "coreai_opt.palettization.kmeans.kmeans_fake_palettize._cluster_vectors",
@@ -332,7 +374,7 @@ class TestPalettizerPlumbing:
         ) as cluster:
             KMeansPalettizer(model, self._config(settings)).prepare((torch.randn(1, 16),))
         assert cluster.call_args.kwargs == {
-            "init": "kmeans++",
+            "n_local_trials": 1,
             "n_init": 2,
             "max_iter": 7,
             "tol": 0.0,
@@ -451,7 +493,7 @@ class TestGPUPaths:
         pytest.importorskip("flash_kmeans")
         pytest.importorskip("sklearn")
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
-        settings = {"init": "greedy_kmeans++", "n_init": 2, "max_iter": 300, "tol": 1e-4}
+        settings = {"n_local_trials": None, "n_init": 2, "max_iter": 300, "tol": 1e-4}
         assert ek.vector_kmeans_backend(weighted=False) == "flash_kmeans"
         gpu = ek.cluster_vectors(list(x), None, 16, **settings)
         with mock.patch.object(ek.torch.cuda, "is_available", return_value=False):
@@ -465,7 +507,7 @@ class TestGPUPaths:
         assert ek.vector_kmeans_backend(weighted=False) == "torch"
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
         results = ek.cluster_vectors(
-            list(x), None, 16, init="greedy_kmeans++", n_init=2, max_iter=300, tol=1e-4
+            list(x), None, 16, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
         )
         for (centroids, _), true_centers in zip(results, centers, strict=True):
             assert torch.cdist(true_centers, centroids).min(-1).values.max() < 0.1
@@ -474,7 +516,7 @@ class TestGPUPaths:
         x, centers = _clustered_blocks(num_blocks=4, points_per_center=40, n_clusters=16)
         weights = torch.rand(x.shape[:2]) + 0.5
         results = ek.cluster_vectors(
-            list(x), list(weights), 16, init="greedy_kmeans++", n_init=2, max_iter=300, tol=1e-4
+            list(x), list(weights), 16, n_local_trials=None, n_init=2, max_iter=300, tol=1e-4
         )
         for (centroids, labels), block, w, true_centers in zip(
             results, x, weights, centers, strict=True

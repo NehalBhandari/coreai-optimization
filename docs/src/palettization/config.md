@@ -239,14 +239,14 @@ kmeans_palettization_config:
 
 ### Tune vector palettization k-means (VectorKMeansConfig)
 
-Vector palettization (`cluster_dim > 1`) runs k-means on each palettization block, and its speed/quality trade-off is set with a {class}`~coreai_opt.palettization.config.VectorKMeansConfig` on the module's {class}`~coreai_opt.palettization.config.ModuleKMeansPalettizerConfig`. Scalar palettization solves 1D k-means exactly and does not use these settings; setting `vector_kmeans` on a module config without any spec that has `cluster_dim > 1` raises an error. If `vector_kmeans` is not set, the defaults below are used.
+Vector palettization (`cluster_dim > 1`) runs k-means on each palettization block, and its speed/quality trade-off is set with a {class}`~coreai_opt.palettization.config.VectorKMeansConfig` on the module's {class}`~coreai_opt.palettization.config.ModuleKMeansPalettizerConfig`. Scalar palettization solves 1D k-means exactly and does not use these settings; setting `vector_kmeans_config` on a module config without any spec that has `cluster_dim > 1` raises an error. If `vector_kmeans_config` is not set, the defaults below are used.
 
-| Field      | Default             | Effect                                                                                                                                                                           |
-| ---------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `init`     | `"greedy_kmeans++"` | Seeding method. `"kmeans++"` samples one candidate per seed; `"greedy_kmeans++"` samples several and keeps the best, for lower clustering error at a few times the seeding cost. |
-| `n_init`   | `5`                 | Number of k-means restarts; the best result is kept per block. Time grows linearly with it.                                                                                      |
-| `max_iter` | `300`               | Maximum Lloyd iterations per restart.                                                                                                                                            |
-| `tol`      | `1e-4`              | A block stops once its clustering error improves by less than `tol` (relative) per iteration, or once no assignment changes. Same on GPU and CPU.                                |
+| Field            | Default | Effect                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `n_local_trials` | `None`  | Candidate centroids sampled at each k-means++ seeding step; the one that most reduces clustering error is kept. `1` is standard k-means++; larger values (greedy k-means++) usually lower the clustering error, at proportionally higher seeding cost. `None` uses scikit-learn's default, `2 + int(log(n_clusters))` (6 for `n_bits=6`, 7 for `n_bits=8`), as in `sklearn.cluster.kmeans_plusplus`. |
+| `n_init`         | `5`     | Number of k-means restarts; the best result is kept per block. Time grows linearly with it.                                                                                                                                                                                                                                                                                                          |
+| `max_iter`       | `300`   | Maximum Lloyd iterations per restart.                                                                                                                                                                                                                                                                                                                                                                |
+| `tol`            | `1e-4`  | A block stops once its clustering error improves by less than `tol` (relative) per iteration, or once no assignment changes. Same on GPU and CPU.                                                                                                                                                                                                                                                    |
 
 Clustering runs where the hardware allows:
 
@@ -271,9 +271,9 @@ Clustering runs where the hardware allows:
 ```
 
 - **GPU**: all vector tensors cluster on the GPU. PTP (data-free post-training palettization) runs its Lloyd iterations with [flash-kmeans](https://github.com/svg-project/flash-kmeans) (Yang et al., 2026, [arXiv:2603.09229](https://arxiv.org/abs/2603.09229)) when it is installed, which is much faster, and otherwise with a PyTorch loop. SKM (Sensitive K-Means, see `calibration_mode()`) always uses the PyTorch loop, because flash-kmeans has no per-point weights.
-- **CPU**: requires `scikit-learn`. As for scalar palettization, `prepare(num_workers=N)` clusters `N` layers in parallel.
+- **CPU**: scikit-learn. As for scalar palettization, `prepare(num_workers=N)` clusters `N` layers in parallel.
 
-Without a GPU, `prepare()` raises an `ImportError` if scikit-learn is not installed. With a GPU, vector tensors run in the main process, one at a time, while the `num_workers` CPU workers handle the scalar tensors.
+With a GPU, vector tensors run in the main process, one at a time, while the `num_workers` CPU workers handle the scalar tensors.
 
 ```python
 from coreai_opt.palettization import (
@@ -303,7 +303,7 @@ fast_config = KMeansPalettizerConfig(
     global_config=ModuleKMeansPalettizerConfig(
         op_state_spec={"weight": spec},
         enable_fast_kmeans_mode=False,
-        vector_kmeans=VectorKMeansConfig(n_init=1, max_iter=1),
+        vector_kmeans_config=VectorKMeansConfig(n_init=1, max_iter=1),
     )
 )
 ```
@@ -318,7 +318,7 @@ kmeans_palettization_config:
         n_bits: 8
         cluster_dim: 2
         granularity: { type: per_grouped_channel, axis: 0, group_size: 32 }
-    vector_kmeans:
+    vector_kmeans_config:
       n_init: 1
       max_iter: 1
 ```
