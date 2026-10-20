@@ -241,12 +241,12 @@ kmeans_palettization_config:
 
 Vector palettization (`cluster_dim > 1`) runs k-means on each palettization block, and its speed/quality trade-off is set with a {class}`~coreai_opt.palettization.config.VectorKMeansConfig` on the module's {class}`~coreai_opt.palettization.config.ModuleKMeansPalettizerConfig`. Scalar palettization solves 1D k-means exactly and does not use these settings; setting `vector_kmeans` on a module config without any spec that has `cluster_dim > 1` raises an error. If `vector_kmeans` is not set, the defaults below are used.
 
-| Field | Default | Effect |
-| --- | --- | --- |
-| `init` | `"greedy_kmeans++"` | Seeding method. `"kmeans++"` samples one candidate per seed; `"greedy_kmeans++"` samples several and keeps the best, for lower clustering error at a few times the seeding cost. |
-| `n_init` | `5` | Number of k-means restarts; the best result is kept per block. Time grows linearly with it. |
-| `max_iter` | `300` | Maximum Lloyd iterations per restart. |
-| `tol` | `1e-4` | A block stops once its clustering error improves by less than `tol` (relative) per iteration, or once no assignment changes. Same on GPU and CPU. |
+| Field      | Default             | Effect                                                                                                                                                                           |
+| ---------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init`     | `"greedy_kmeans++"` | Seeding method. `"kmeans++"` samples one candidate per seed; `"greedy_kmeans++"` samples several and keeps the best, for lower clustering error at a few times the seeding cost. |
+| `n_init`   | `5`                 | Number of k-means restarts; the best result is kept per block. Time grows linearly with it.                                                                                      |
+| `max_iter` | `300`               | Maximum Lloyd iterations per restart.                                                                                                                                            |
+| `tol`      | `1e-4`              | A block stops once its clustering error improves by less than `tol` (relative) per iteration, or once no assignment changes. Same on GPU and CPU.                                |
 
 Clustering runs where the hardware allows:
 
