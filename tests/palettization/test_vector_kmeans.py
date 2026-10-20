@@ -327,7 +327,7 @@ class TestPalettizerPlumbing:
         settings = VectorKMeansConfig(init="kmeans++", n_init=2, max_iter=7, tol=0.0)
         model = _Linear()
         with mock.patch(
-            "coreai_opt.palettization.kmeans.kmeans_fake_palettize.cluster_vectors",
+            "coreai_opt.palettization.kmeans.kmeans_fake_palettize._cluster_vectors",
             wraps=ek.cluster_vectors,
         ) as cluster:
             KMeansPalettizer(model, self._config(settings)).prepare((torch.randn(1, 16),))

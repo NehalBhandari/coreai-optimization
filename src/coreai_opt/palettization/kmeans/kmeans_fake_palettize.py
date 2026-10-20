@@ -33,7 +33,7 @@ from coreai_opt.quantization.spec import (
     QuantizationSpec,
 )
 
-from ._efficient_kmeans import cluster_vectors
+from ._efficient_kmeans import cluster_vectors as _cluster_vectors
 from .kmeans_support_mixins import _LinearPalettizationMixin
 from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
@@ -873,7 +873,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             ]
 
         settings = self.vector_kmeans
-        return cluster_vectors(
+        return _cluster_vectors(
             vectors,
             sample_weights,
             num_clusters,

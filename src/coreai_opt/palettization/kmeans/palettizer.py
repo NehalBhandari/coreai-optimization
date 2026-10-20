@@ -47,7 +47,7 @@ from coreai_opt.palettization.spec.fake_palettize import (
     _enable_fake_palett,
 )
 
-from ._efficient_kmeans import vector_kmeans_backend
+from ._efficient_kmeans import vector_kmeans_backend as _vector_kmeans_backend
 from ._prepare_for_export import (
     prepare_for_mil_export as _prepare_for_mil_export,
     prepare_for_mlir_export as _prepare_for_mlir_export,
@@ -607,12 +607,12 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 "Clustering %d vector-palettized tensors on the GPU (unweighted Lloyd "
                 "iterations: %s) and %d tensors on CPU (num_workers=%d)",
                 len(gpu_info),
-                vector_kmeans_backend(weighted=False),
+                _vector_kmeans_backend(weighted=False),
                 len(cpu_info),
                 self._num_workers,
             )
         elif any(info.fp_module.cluster_dim > 1 for info in cpu_info):
-            vector_kmeans_backend(weighted=False)  # raise now if scikit-learn is missing
+            _vector_kmeans_backend(weighted=False)  # raise now if scikit-learn is missing
 
         if self._num_workers <= 1 or not cpu_info:
             self._calculate_centroids_sequential(fp_info)
