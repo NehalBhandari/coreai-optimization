@@ -3,167 +3,434 @@
 # Use of this source code is governed by a BSD-3-Clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-import numpy as _np
-import torch as _torch
+"""Vector k-means for palettization (``cluster_dim > 1``).
+
+Each palettization block is an independent k-means problem over ``cluster_dim``-long
+vectors. :func:`cluster_vectors` solves all blocks of one weight tensor and picks the
+backend from the device:
+
+- **GPU**: batched k-means++ seeding (weight-proportional for sensitivity-weighted
+  clustering), then Lloyd iterations with all blocks of the tensor in one batch: with
+  flash-kmeans (Triton) for unweighted clustering when it is installed, otherwise with a
+  batched torch loop, which also supports per-point weights.
+- **CPU**: scikit-learn ``kmeans_plusplus`` and ``KMeans``, one block at a time.
+
+On every backend a block stops iterating once its inertia improves by less than ``tol``
+(relative) per iteration, checked every few iterations, or once no assignment changes.
+``n_init`` restarts run sequentially and the best one is kept per block. Final centroids
+are always the exact (weighted) means of the final clusters.
+"""
+
+import functools
+import math
+
+import numpy as np
+import torch
+
+#: Lloyd iterations between convergence checks.
+_CHECK_EVERY = 5
+
+#: Keeps the torch Lloyd loop's ``(B, chunk, K)`` distance tile near 0.5 GB.
+_TORCH_DIST_ELEMENTS = 2**27
 
 
-class _EfficientKMeans:
+@functools.cache
+def _flash_kmeans_available() -> bool:
+    """Whether flash-kmeans imports with its Triton kernels, not its torch fallback."""
+    try:
+        from flash_kmeans import batch_kmeans_Euclid  # noqa: PLC0415 - optional dependency
+    except Exception:  # noqa: BLE001 - any import failure means "not available"
+        return False
+    return bool(batch_kmeans_Euclid.__module__ != "flash_kmeans.torch_fallback")
+
+
+@functools.cache
+def _sklearn_available() -> bool:
+    """Whether scikit-learn is importable."""
+    try:
+        import sklearn.cluster  # noqa: F401, PLC0415 - optional dependency
+    except ImportError:
+        return False
+    return True
+
+
+def vector_kmeans_backend(weighted: bool) -> str:
+    """Return the backend :func:`cluster_vectors` uses on this machine.
+
+    Args:
+        weighted (bool): Whether per-point sample weights (sensitivities) are given.
+
+    Returns:
+        str: On a CUDA GPU, ``"flash_kmeans"`` (unweighted, flash-kmeans installed) or
+        ``"torch"``; otherwise ``"sklearn"`` (CPU).
+
+    Raises:
+        ImportError: If there is no CUDA GPU and scikit-learn is not installed.
     """
-    An implementation of k-means which runs entirely on GPU.
+    if torch.cuda.is_available():
+        return "flash_kmeans" if not weighted and _flash_kmeans_available() else "torch"
+    if _sklearn_available():
+        return "sklearn"
+    raise ImportError(
+        "Vector palettization (cluster_dim > 1) without a CUDA GPU needs scikit-learn: "
+        "install 'scikit-learn'."
+    )
+
+
+def _n_local_trials(init: str, n_clusters: int) -> int:
+    """Candidates per k-means++ step: 1 for standard, scikit-learn's count for greedy."""
+    if init == "greedy_kmeans++":
+        return 2 + int(math.log(n_clusters))
+    return 1
+
+
+def _tensor_seed(x: torch.Tensor) -> int:
+    """Deterministic random seed derived from a tensor's contents.
+
+    Makes clustering reproducible across runs while giving each tensor its own random
+    stream, so same-shaped tensors do not share seeds.
     """
+    flat = x.flatten()
+    probe = flat[:: max(1, flat.numel() // 64)][:64].double().tolist()
+    return hash((tuple(x.shape), tuple(round(v, 6) for v in probe))) % (2**31 - 1)
 
-    def __init__(
-        self,
-        n_clusters: int,
-        init: str,
-        n_init: int = 0,
-        max_iter: int = 100,
-        tol: float = 0.0001,
-    ):
-        self.n_clusters = n_clusters
-        self.n_init = n_init
-        self.max_iter = max_iter
-        self.tol = tol
-        self.labels_ = None
-        self.inertia_ = None
-        self.cluster_centers_ = init
 
-        assert self.max_iter > 0
-        assert self.n_clusters > 0
+def batched_kmeanspp_init(
+    x: torch.Tensor,
+    n_clusters: int,
+    n_local_trials: int,
+    generator: torch.Generator,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """k-means++ seeding for a batch of independent blocks at once.
 
-    @staticmethod
-    def _get_cluster_avg(
-        n_clusters: int,
-        indices: _torch.Tensor,
-        vals: _torch.Tensor,
-        sample_weight: _torch.Tensor | None = None,
-    ) -> _torch.Tensor:
-        agg_vals = (
-            vals.float() * sample_weight.float() if sample_weight is not None else vals.float()
+    Each new seed is sampled with probability proportional to ``w * d^2``: a point's
+    weight times its squared distance to the nearest seed chosen so far. With
+    ``n_local_trials > 1`` (greedy k-means++), that many candidates are drawn per step
+    and the one leaving the lowest remaining weighted potential is kept. The
+    ``n_clusters`` steps are sequential, but each step is vectorized across blocks.
+
+    Args:
+        x (torch.Tensor): ``(B, N, D)`` vectorized blocks.
+        n_clusters (int): Seeds per block. Must be ``<= N``.
+        n_local_trials (int): Candidates per step; 1 is standard k-means++.
+        generator (torch.Generator): Random generator on ``x``'s device.
+        weights (torch.Tensor | None): Optional ``(B, N)`` non-negative point weights.
+
+    Returns:
+        torch.Tensor: ``(B, n_clusters, D)`` seeds, each a point of its own block.
+
+    Raises:
+        ValueError: If ``n_clusters`` exceeds the number of points per block.
+    """
+    b, n, d = x.shape
+    if n_clusters > n:
+        raise ValueError(f"n_clusters {n_clusters} exceeds {n} points per block")
+    rows = torch.arange(b, device=x.device)
+    x_sq = (x**2).sum(-1)
+    w = torch.ones(b, n, device=x.device) if weights is None else weights.float()
+
+    seeds = torch.empty(b, n_clusters, d, device=x.device, dtype=x.dtype)
+    first = torch.multinomial(w.clamp_min(0) + 1e-30, 1, generator=generator).squeeze(1)
+    seeds[:, 0] = x[rows, first]
+    closest = ((x - seeds[:, 0:1]) ** 2).sum(-1)
+
+    for i in range(1, n_clusters):
+        potential = (w * closest).clamp_min(0)
+        # Once every point of a block coincides with a seed its potential is zero and it
+        # cannot be sampled from; draw uniformly for that block instead.
+        degenerate = potential.sum(dim=1) <= 0
+        if bool(degenerate.any()):
+            potential[degenerate] = 1.0
+        cand = torch.multinomial(potential, n_local_trials, generator=generator)
+        cand_pts = torch.gather(x, 1, cand.unsqueeze(-1).expand(-1, -1, d))
+        # (B, N, trials) squared distances via the norm trick.
+        dist = (
+            x_sq.unsqueeze(-1)
+            - 2.0 * torch.bmm(x, cand_pts.transpose(1, 2))
+            + (cand_pts**2).sum(-1).unsqueeze(1)
+        ).clamp_min_(0)
+        new_closest = torch.minimum(closest.unsqueeze(-1), dist)
+        best = (w.unsqueeze(-1) * new_closest).sum(dim=1).argmin(dim=1)
+        seeds[:, i] = cand_pts[rows, best]
+        closest = new_closest[rows, :, best]
+    return seeds
+
+
+def batched_cluster_avg(
+    x: torch.Tensor,
+    labels: torch.Tensor,
+    n_clusters: int,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Exact (weighted) per-cluster means for a batch of blocks.
+
+    Args:
+        x (torch.Tensor): ``(B, N, D)`` points.
+        labels (torch.Tensor): ``(B, N)`` cluster index per point.
+        n_clusters (int): Number of clusters.
+        weights (torch.Tensor | None): Optional ``(B, N)`` point weights.
+
+    Returns:
+        torch.Tensor: ``(B, n_clusters, D)`` float32 means; empty clusters are zero.
+    """
+    b, _, d = x.shape
+    idx = labels.long()
+    w = torch.ones(idx.shape, device=x.device) if weights is None else weights.float()
+    sums = torch.zeros(b, n_clusters, d, device=x.device)
+    sums.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, d), x.float() * w.unsqueeze(-1))
+    mass = torch.zeros(b, n_clusters, device=x.device).scatter_add_(1, idx, w)
+    return sums / mass.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)
+
+
+def _block_inertia(
+    x: torch.Tensor, labels: torch.Tensor, n_clusters: int, weights: torch.Tensor | None
+) -> torch.Tensor:
+    """``(B,)`` (weighted) inertia of each block under the exact means of ``labels``."""
+    centroids = batched_cluster_avg(x, labels, n_clusters, weights)
+    picked = torch.gather(centroids, 1, labels.long().unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+    sq = ((x.float() - picked) ** 2).sum(-1)
+    return (sq if weights is None else sq * weights).sum(-1)
+
+
+def _flash_lloyd_steps(
+    x: torch.Tensor, centroids: torch.Tensor, steps: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ``steps`` flash-kmeans Lloyd iterations and return ``(labels, centroids)``."""
+    from flash_kmeans import batch_kmeans_Euclid  # noqa: PLC0415 - optional dependency
+
+    labels, centroids, _ = batch_kmeans_Euclid(
+        x, n_clusters=centroids.shape[1], max_iters=steps, tol=0.0, init_centroids=centroids
+    )
+    return labels.long(), centroids.float()
+
+
+def _torch_lloyd_steps(
+    x: torch.Tensor, centroids: torch.Tensor, steps: int, weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ``steps`` weighted Lloyd iterations and return ``(labels, centroids)``.
+
+    Distances use the norm trick, chunked over ``N`` so the ``(B, N, K)`` distance matrix
+    is never materialized in full. An empty cluster keeps its previous centroid.
+    """
+    b, n, d = x.shape
+    k = centroids.shape[1]
+    chunk = max(1, min(n, _TORCH_DIST_ELEMENTS // max(1, b * k)))
+    w = weights.float()
+    labels = torch.empty(b, n, dtype=torch.long, device=x.device)
+    x_sq = (x**2).sum(-1)
+    for _ in range(steps):
+        c_sq = (centroids**2).sum(-1)
+        for start in range(0, n, chunk):
+            dist = (
+                x_sq[:, start : start + chunk].unsqueeze(-1)
+                + c_sq.unsqueeze(1)
+                - 2.0 * torch.bmm(x[:, start : start + chunk], centroids.transpose(1, 2))
+            )
+            labels[:, start : start + chunk] = dist.argmin(-1)
+        mass = torch.zeros(b, k, device=x.device).scatter_add_(1, labels, w)
+        sums = torch.zeros(b, k, d, device=x.device).scatter_add_(
+            1, labels.unsqueeze(-1).expand(-1, -1, d), x * w.unsqueeze(-1)
         )
-        v_sum = (
-            _torch.zeros([n_clusters] + list(vals[0].size()))
-            .to(vals.device)
-            .index_add_(0, indices, agg_vals)
+        centroids = torch.where(
+            mass.unsqueeze(-1) > 0, sums / mass.clamp_min(1e-30).unsqueeze(-1), centroids
         )
-        weight = (
-            _torch.ones(len(vals), dtype=_torch.int).to(vals.device)
-            if sample_weight is None
-            else sample_weight.squeeze(1).to(vals.device)
+    return labels, centroids
+
+
+def _lloyd_until_converged(
+    x: torch.Tensor,
+    seeds: torch.Tensor,
+    weights: torch.Tensor | None,
+    max_iter: int,
+    tol: float,
+    use_flash: bool,
+) -> torch.Tensor:
+    """One restart of batched Lloyd iterations with a per-block relative-inertia stop.
+
+    Runs ``_CHECK_EVERY`` iterations at a time. A block has converged once its inertia
+    improved by less than ``tol`` per iteration over the last chunk, i.e.
+    ``(J_prev - J) / J < tol * steps``, or once no assignment changed over the last
+    chunk. The batch keeps a fixed shape, so flash-kmeans
+    reuses its compiled kernels; converged blocks keep iterating, which never raises
+    their inertia, and the restart ends once every block has converged or ``max_iter``
+    iterations have run.
+
+    Args:
+        x (torch.Tensor): ``(B, N, D)`` vectorized blocks.
+        seeds (torch.Tensor): ``(B, K, D)`` initial centroids.
+        weights (torch.Tensor | None): Optional ``(B, N)`` point weights.
+        max_iter (int): Iteration cap.
+        tol (float): Relative inertia improvement per iteration below which a block stops.
+        use_flash (bool): Run the iterations with flash-kmeans (unweighted only) instead
+            of the torch loop.
+
+    Returns:
+        torch.Tensor: ``(B, N)`` labels from the last assignment step.
+    """
+    n_clusters = seeds.shape[1]
+    centroids = seeds.float()
+    torch_weights = torch.ones(x.shape[:2], device=x.device) if weights is None else weights
+    prev = torch.full((x.shape[0],), float("inf"), device=x.device)
+    converged = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+    prev_labels = None
+    done = 0
+    while done < max_iter:
+        steps = min(_CHECK_EVERY, max_iter - done)
+        if use_flash:
+            labels, centroids = _flash_lloyd_steps(x, centroids, steps)
+        else:
+            labels, centroids = _torch_lloyd_steps(x, centroids, steps, torch_weights)
+        done += steps
+        inertia = _block_inertia(x, labels, n_clusters, weights)
+        # On the first chunk prev is inf, so the improvement is inf and nothing converges.
+        improvement = (prev - inertia) / inertia.clamp_min(torch.finfo(torch.float32).tiny)
+        converged |= improvement < tol * steps
+        if prev_labels is not None:
+            converged |= (labels == prev_labels).all(dim=1)
+        prev, prev_labels = inertia, labels
+        if bool(converged.all()):
+            break
+    return labels
+
+
+def _cluster_gpu(
+    x: torch.Tensor,
+    weights: torch.Tensor | None,
+    n_clusters: int,
+    init: str,
+    n_init: int,
+    max_iter: int,
+    tol: float,
+    use_flash: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched GPU k-means over ``(B, N, D)`` blocks; returns ``(centroids, labels)``."""
+    trials = _n_local_trials(init, n_clusters)
+    base_seed = _tensor_seed(x)
+    best_labels, best_inertia = None, None
+    for restart in range(n_init):
+        generator = torch.Generator(device=x.device)
+        generator.manual_seed(base_seed + 7919 * restart)
+        seeds = batched_kmeanspp_init(x, n_clusters, trials, generator, weights)
+        labels = _lloyd_until_converged(x, seeds, weights, max_iter, tol, use_flash)
+        inertia = _block_inertia(x, labels, n_clusters, weights)
+        if best_labels is None:
+            best_labels, best_inertia = labels, inertia
+        else:
+            better = inertia < best_inertia
+            best_labels = torch.where(better.unsqueeze(-1), labels, best_labels)
+            best_inertia = torch.minimum(inertia, best_inertia)
+    return batched_cluster_avg(x, best_labels, n_clusters, weights), best_labels
+
+
+def _cluster_sklearn(
+    x: torch.Tensor,
+    weights: torch.Tensor | None,
+    n_clusters: int,
+    init: str,
+    n_init: int,
+    max_iter: int,
+    tol: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """scikit-learn k-means on one ``(N, D)`` block; returns ``(centroids, labels)``.
+
+    Seeds come from ``kmeans_plusplus`` (standard or greedy, matching the GPU paths), so
+    restarts are run here rather than through ``KMeans(n_init=...)``. Lloyd iterations
+    run ``_CHECK_EVERY`` at a time with scikit-learn's own ``tol`` off, so the block stops
+    on the same relative-inertia criterion as the GPU paths; scikit-learn still ends a
+    chunk early when no assignment changes, which also stops the block.
+    """
+    from sklearn.cluster import KMeans, kmeans_plusplus  # noqa: PLC0415 - optional dependency
+
+    def lloyd_until_converged(seeds: np.ndarray) -> KMeans:
+        centers, prev, done = seeds, np.inf, 0
+        while True:
+            steps = min(_CHECK_EVERY, max_iter - done)
+            fitted = KMeans(n_clusters, init=centers, n_init=1, max_iter=steps, tol=0.0).fit(
+                points, sample_weight=w
+            )
+            done += fitted.n_iter_
+            improvement = (prev - fitted.inertia_) / max(fitted.inertia_, np.finfo(np.float32).tiny)
+            # Fewer iterations than requested means no assignment changed: a fixed point.
+            if fitted.n_iter_ < steps or improvement < tol * steps or done >= max_iter:
+                return fitted
+            centers, prev = fitted.cluster_centers_, fitted.inertia_
+
+    points = x.float().numpy()
+    w = None if weights is None else weights.float().numpy()
+    trials = _n_local_trials(init, n_clusters)
+    base_seed = _tensor_seed(x)
+    best = None
+    for restart in range(n_init):
+        random_state = np.random.RandomState((base_seed + 7919 * restart) % (2**31 - 1))
+        seeds, _ = kmeans_plusplus(
+            points, n_clusters, sample_weight=w, random_state=random_state, n_local_trials=trials
         )
-        v_numel = (
-            _torch.zeros(n_clusters, dtype=weight.dtype)
-            .to(vals.device)
-            .index_add_(0, indices, weight)
+        fitted = lloyd_until_converged(seeds)
+        if best is None or fitted.inertia_ < best.inertia_:
+            best = fitted
+    assert best is not None  # n_init >= 1
+    labels = torch.from_numpy(best.labels_).long()
+    batch_weights = None if weights is None else weights.float().unsqueeze(0)
+    centroids = batched_cluster_avg(
+        x.float().unsqueeze(0), labels.unsqueeze(0), n_clusters, batch_weights
+    )
+    return centroids[0], labels
+
+
+def cluster_vectors(
+    blocks: list[torch.Tensor],
+    weights: list[torch.Tensor] | None,
+    n_clusters: int,
+    init: str,
+    n_init: int,
+    max_iter: int,
+    tol: float,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Cluster every vectorized block of one weight tensor.
+
+    Args:
+        blocks (list[torch.Tensor]): Per-block ``(N, D)`` vectors.
+        weights (list[torch.Tensor] | None): Optional per-block ``(N,)`` point weights.
+        n_clusters (int): Clusters per block. Must be ``<= N``.
+        init (str): ``"kmeans++"`` or ``"greedy_kmeans++"``.
+        n_init (int): Restarts; the lowest-inertia one is kept per block.
+        max_iter (int): Lloyd iteration cap per restart.
+        tol (float): Convergence tolerance, see the module docstring.
+
+    Returns:
+        list[tuple[torch.Tensor, torch.Tensor]]: Per block, CPU ``(centroids, labels)``
+        of shapes ``(n_clusters, D)`` and ``(N,)``.
+
+    Raises:
+        ImportError: If no k-means backend is available.
+    """
+    backend = vector_kmeans_backend(weighted=weights is not None)
+    if backend == "sklearn":
+        return [
+            _cluster_sklearn(
+                block,
+                None if weights is None else weights[i],
+                n_clusters,
+                init,
+                n_init,
+                max_iter,
+                tol,
+            )
+            for i, block in enumerate(blocks)
+        ]
+
+    # One GPU batch per distinct block shape; all blocks of a tensor normally share one.
+    by_shape: dict[tuple[int, ...], list[int]] = {}
+    for i, block in enumerate(blocks):
+        by_shape.setdefault(tuple(block.shape), []).append(i)
+    results: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for idxs in by_shape.values():
+        x = torch.stack([blocks[i] for i in idxs]).cuda().float().contiguous()
+        w = None if weights is None else torch.stack([weights[i] for i in idxs]).cuda().float()
+        centroids, labels = _cluster_gpu(
+            x, w, n_clusters, init, n_init, max_iter, tol, use_flash=backend == "flash_kmeans"
         )
-        v_numel[v_numel == 0] = 1
-
-        v_avg = v_sum / v_numel.reshape(-1, 1)
-
-        return v_avg.to(vals.dtype)
-
-    def _kmeans_pp(
-        self, parameters: _torch.Tensor, sample_weight: _torch.Tensor | None = None
-    ) -> None:
-        assert len(parameters) >= self.n_clusters
-
-        num_update_list = []
-        INIT_EXIT = 10
-        self.inertia_ = int(1e9)
-
-        # n_init trials for estimating cluster centers
-        for n in range(self.n_init):
-            if n % 2 and sample_weight is not None:
-                centroids = parameters[
-                    _np.random.choice(
-                        len(parameters),
-                        self.n_clusters,
-                        False,
-                        (sample_weight.squeeze() / sample_weight.sum()).cpu().numpy(),
-                    )
-                ]
-            else:
-                centroids = _torch.zeros(
-                    (self.n_clusters, parameters.size(-1)),
-                    device=parameters.device,
-                    dtype=parameters.dtype,
-                )
-                for i in range(self.n_clusters):
-                    if i == 0:
-                        centroids[i] = parameters[_torch.randint(0, len(parameters), [1])]
-                        d_ij_curr = _torch.cdist(centroids[:i], parameters)
-                    else:
-                        d_ij_prev = _torch.cdist(centroids[i - 1 : i], parameters)
-                        d_ij_prev[d_ij_prev == 0] = -int(1e9)
-
-                        d_ij_curr = _torch.cat((d_ij_curr, d_ij_prev), dim=0)
-
-                        c_to_x = _torch.min(d_ij_curr, dim=0)
-                        centroids[i] = parameters[c_to_x[0].argmax()]
-
-            last_inertia = int(1e9)
-            num_update = 0
-            for _ in range(self.max_iter):
-                min_error, labels = _torch.cdist(parameters, centroids).min(dim=-1)
-
-                min_error = (
-                    min_error * (sample_weight.T).sqrt() if sample_weight is not None else min_error
-                )
-
-                centroids.zero_()
-                agg_params = parameters * sample_weight if sample_weight is not None else parameters
-                weights = sample_weight.view(labels.size()) if sample_weight is not None else None
-                centroids.scatter_add_(
-                    0,
-                    labels.view(-1, 1).expand([-1, parameters.size(-1)]),
-                    agg_params,
-                )
-                n_centroids = _torch.bincount(
-                    labels, weights=weights, minlength=self.n_clusters
-                ).view(-1, 1)
-
-                centroids /= n_centroids
-                cur_inertia = min_error.square().sum()
-
-                # update labels and cluster_centers if inertia improves
-                if cur_inertia < self.inertia_:
-                    num_update += 1
-                    self.inertia_ = cur_inertia
-                    self.labels_ = labels
-                    self.cluster_centers_ = centroids
-
-                # exit if there is no improvement in inertia within a tolerance
-                elif last_inertia <= cur_inertia * (1 + self.tol):
-                    break
-
-                last_inertia = cur_inertia
-
-            num_update_list.append(num_update)
-
-            # In every trial, we track number of cluster centre updates.
-            # If number of trials are greater than a specified value INIT_EXIT and
-            # there is no update for the past INIT_EXIT number of trials,
-            # it indicates that the centroids have converged
-            if len(num_update_list) >= INIT_EXIT and sum(num_update_list[-INIT_EXIT:]) == 0:
-                break
-
-    def fit(
-        self, X: _torch.Tensor, sample_weight: _torch.Tensor | None = None
-    ) -> "_EfficientKMeans":
-        """
-        Compute k-means clustering.
-        """
-        N = len(X)
-
-        assert N >= self.n_clusters, f"too many clusters {self.n_clusters} for {N} samples"
-
-        if self.cluster_centers_ != "kmeans++":
-            raise ValueError(f"init must be 'kmeans++'; got {self.cluster_centers_!r}")
-
-        self._kmeans_pp(X.float(), sample_weight=sample_weight)
-
-        self.cluster_centers_ = _EfficientKMeans._get_cluster_avg(
-            self.n_clusters, self.labels_, X, sample_weight=sample_weight
-        )
-
-        return self
+        for j, i in enumerate(idxs):
+            results[i] = (centroids[j].cpu(), labels[j].cpu())
+    return [results[i] for i in range(len(blocks))]
