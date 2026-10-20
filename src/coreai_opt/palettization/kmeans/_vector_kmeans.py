@@ -158,11 +158,13 @@ def batched_kmeanspp_init(
     for i in range(1, n_clusters):
         potential = (w * closest).clamp_min(0)
         # Once every point of a block coincides with a seed its potential is zero and it
-        # cannot be sampled from; draw uniformly for that block instead.
-        degenerate = potential.sum(dim=1) <= 0
-        if bool(degenerate.any()):
-            potential[degenerate] = 1.0
-        cand = torch.multinomial(potential, n_local_trials, generator=generator)
+        # cannot be sampled from; draw uniformly for that block instead. torch.where keeps
+        # this on the device: checking degenerate.any() on the host would sync every step.
+        degenerate = potential.sum(dim=1, keepdim=True) <= 0
+        potential = torch.where(degenerate, 1.0, potential)
+        # With replacement, as scikit-learn does: valid for any n_local_trials, and never
+        # picks a zero-potential point (one already at a seed) as a candidate.
+        cand = torch.multinomial(potential, n_local_trials, replacement=True, generator=generator)
         cand_pts = torch.gather(x, 1, cand.unsqueeze(-1).expand(-1, -1, d))
         # (B, N, trials) squared distances via the norm trick.
         dist = (
