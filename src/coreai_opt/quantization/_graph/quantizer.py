@@ -1215,6 +1215,7 @@ class GraphQuantizer(_BaseQuantizer):
         # allow_exported_model_train_eval again on the converted model.
         allow_exported_model_train_eval(finalized_model)
 
+        self._unmark_model_as_prepared(finalized_model)
         return finalized_model
 
     @contextmanager

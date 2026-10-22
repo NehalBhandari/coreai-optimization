@@ -235,6 +235,7 @@ class TestGraphModeQuantizer:
         finalized_model = quantizer.finalize(prepared_model, ExportBackend.Torch)
 
         assert isinstance(finalized_model, torch.fx.GraphModule)
+        assert not quantizer._is_model_prepared(finalized_model)
         fake_quant_mods = [
             m for m in finalized_model.modules() if isinstance(m, FakeQuantizeImplBase)
         ]
@@ -327,6 +328,7 @@ class TestGraphModeQuantizer:
         fake_quant_nodes = get_fake_quant_nodes(prepared_model)
 
         finalized_model = quantizer.finalize(backend=ExportBackend.CoreML)
+        assert not quantizer._is_model_prepared(finalized_model)
 
         # Count activation quantization modules (Sequential containing
         # quantize + dequantize)
@@ -364,6 +366,7 @@ class TestGraphModeQuantizer:
         assert len(fake_quant_nodes) == 4
 
         finalized_model = quantizer.finalize(backend=ExportBackend.CoreAI)
+        assert not quantizer._is_model_prepared(finalized_model)
 
         blockwise_shift_scale_nodes = finalized_model.graph.find_nodes(
             op="call_function", target=coreai.constexpr_blockwise_shift_scale

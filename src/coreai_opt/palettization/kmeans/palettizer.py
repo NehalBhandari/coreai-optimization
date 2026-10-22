@@ -532,10 +532,7 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 msg = f"Unsupported backend: {backend}"
                 raise NotImplementedError(msg)
 
-        # Clear the prepared flag so the finalized model can be further processed
-        # (e.g., by Quantizer for activation quantization after weight palettization)
-        if hasattr(finalized_model, "_coreai_opt_prepared"):
-            delattr(finalized_model, "_coreai_opt_prepared")
+        self._unmark_model_as_prepared(finalized_model)
 
         return finalized_model
 

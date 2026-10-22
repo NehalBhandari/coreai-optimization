@@ -506,6 +506,7 @@ class TestKMeansPalettizer:
             simple_conv_linear_model, basic_config, simple_model_input, None, backend
         )
 
+        assert not KMeansPalettizer._is_model_prepared(finalized)
         weight_modules = [m for m in finalized.modules() if isinstance(m, (nn.Conv2d, nn.Linear))]
         assert weight_modules, "fixture regressed: no Conv2d/Linear to check"
 

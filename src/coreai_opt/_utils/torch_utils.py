@@ -395,14 +395,17 @@ def fold_compression_parametrizations(
     ]
 
     folded_originals: set[int] = set()
-    with move_model_to_eval(model):
-        for module, tensor_name in to_fold:
-            original = module.parametrizations[tensor_name].original
-            # A tensor tied to one folded earlier shares its ``original``, which already
-            # holds the folded value; re-applying the parametrizations would compress it twice.
-            leave_parametrized = id(original) not in folded_originals
-            folded_originals.add(id(original))
-            P.remove_parametrizations(module, tensor_name, leave_parametrized=leave_parametrized)
+    for module, tensor_name in to_fold:
+        parametrizations = module.parametrizations[tensor_name]
+        # Only the parametrizations are moved to eval: they are discarded by the fold, so
+        # their mode needs no restoring and the rest of the model is left untouched.
+        parametrizations.eval()
+        original = parametrizations.original
+        # A tensor tied to one folded earlier shares its ``original``, which already
+        # holds the folded value; re-applying the parametrizations would compress it twice.
+        leave_parametrized = id(original) not in folded_originals
+        folded_originals.add(id(original))
+        P.remove_parametrizations(module, tensor_name, leave_parametrized=leave_parametrized)
 
     return len(to_fold)
 

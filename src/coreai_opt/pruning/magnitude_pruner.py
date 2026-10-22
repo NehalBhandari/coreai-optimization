@@ -178,6 +178,7 @@ class MagnitudePruner(_BasePruner, _EagerCompressionComponentBuilderMixin):
             case _:
                 raise ValueError(f"Unsupported backend: {backend}")
 
+        self._unmark_model_as_prepared(model)
         if update_internal:
             self._model = model
         return model

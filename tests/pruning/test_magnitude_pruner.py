@@ -85,6 +85,7 @@ class TestMagnitudePruner:
         prepared_weight = model.weight.detach().clone()
 
         finalized = pruner.finalize()
+        assert not pruner._is_model_prepared(finalized)
         assert hasattr(finalized, "parametrizations")
         assert "weight" in finalized.parametrizations
 
@@ -107,6 +108,7 @@ class TestMagnitudePruner:
 
         finalized = pruner.finalize(backend=ExportBackend.Torch)
 
+        assert not pruner._is_model_prepared(finalized)
         assert not hasattr(finalized, "parametrizations")
         assert torch.equal(finalized.weight, prepared_weight)
         torch.testing.assert_close(finalized(example_input), expected_output)

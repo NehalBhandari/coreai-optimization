@@ -289,6 +289,7 @@ class EagerQuantizer(_BaseQuantizer, EagerCompressionComponentBuilderMixin):
                 msg = f"Unsupported backend {backend}"
                 raise ValueError(msg)
 
+        self._unmark_model_as_prepared(finalized_model)
         return finalized_model
 
     @contextmanager

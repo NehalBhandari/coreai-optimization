@@ -79,6 +79,21 @@ class _BaseModelCompressor(ABC):
         """
         model.register_buffer(_COREAI_OPT_PREPARED_ATTR, torch.tensor(True), persistent=False)
 
+    @staticmethod
+    def _unmark_model_as_prepared(model: torch.nn.Module) -> None:
+        """
+        Clear the prepared marker from a model.
+
+        Called at the end of ``finalize`` so the finalized model can be further
+        processed (e.g., by Quantizer for activation quantization after weight
+        palettization).
+
+        Args:
+            model: The model to unmark.
+        """
+        if hasattr(model, _COREAI_OPT_PREPARED_ATTR):
+            delattr(model, _COREAI_OPT_PREPARED_ATTR)
+
     @classmethod
     def supported_modules(cls) -> tuple[type[torch.nn.Module]]:
         """

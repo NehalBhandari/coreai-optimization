@@ -397,6 +397,7 @@ class TestEagerQuantizer:
         """
         finalized = self._quantize_model(simple_model, basic_config, example_input, None, backend)
 
+        assert not Quantizer._is_model_prepared(finalized)
         weight_modules = [m for m in finalized.modules() if isinstance(m, (nn.Conv2d, nn.Linear))]
         assert weight_modules, "fixture regressed: no Conv2d/Linear to check"
 
