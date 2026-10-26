@@ -182,7 +182,8 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 main process instead, concurrently with the workers. Defaults to ``1``.
             state_dict: Optional state dict from a model previously prepared
                 with the same config. When provided, buffers are loaded from it
-                instead of running k-means clustering.
+                instead of running k-means clustering. Fake palettization is left
+                enabled, as a regular ``prepare`` leaves it.
 
         Returns:
             The prepared nn.Module with fake palettization
