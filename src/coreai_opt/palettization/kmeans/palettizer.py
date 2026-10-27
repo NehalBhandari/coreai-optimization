@@ -191,6 +191,7 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
 
         Raises:
             RuntimeError: If the model has already been prepared.
+            RuntimeError: If ``state_dict`` does not match the prepared model.
             ValueError: If ``num_workers`` is less than 1.
         """
         if num_workers < 1:

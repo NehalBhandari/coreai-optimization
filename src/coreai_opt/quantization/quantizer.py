@@ -361,6 +361,10 @@ class Quantizer(_BaseQuantizer):
             The prepared model with fake quantization modules inserted, ready for
             calibration or training. This is a data-free PTQ compressed model.
 
+        Raises:
+            RuntimeError: If the model has already been prepared.
+            RuntimeError: If ``state_dict`` does not match the prepared model.
+
         Note:
             In graph mode, the returned ``fx.GraphModule`` supports calling
             ``.train()`` and ``.eval()``, but with limited effect: only dropout

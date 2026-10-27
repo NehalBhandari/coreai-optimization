@@ -124,6 +124,7 @@ class MagnitudePruner(_BasePruner, _EagerCompressionComponentBuilderMixin):
 
         Raises:
             RuntimeError: If the model has already been prepared.
+            RuntimeError: If ``state_dict`` does not match the prepared model.
         """
         if self._is_model_prepared(self._model):
             raise RuntimeError(

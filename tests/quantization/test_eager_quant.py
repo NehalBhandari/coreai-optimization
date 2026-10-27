@@ -289,16 +289,14 @@ class TestEagerQuantizer:
         assert output.shape == (1, 10)
 
     def test_multiple_prepare_calls(self, simple_model, basic_config, example_input):
-        """
-        If we re-prepare the model, it should throw a warning
-        """
+        """Re-preparing the model raises, with or without a state dict."""
         quantizer = Quantizer(simple_model, basic_config)
 
-        first_prepare = quantizer.prepare((example_input,))
-        with pytest.warns():
-            second_prepare = quantizer.prepare((example_input,))
-
-        assert first_prepare is second_prepare
+        prepared_model = quantizer.prepare((example_input,))
+        with pytest.raises(RuntimeError, match="Model has already been prepared"):
+            quantizer.prepare((example_input,))
+        with pytest.raises(RuntimeError, match="Model has already been prepared"):
+            quantizer.prepare((example_input,), state_dict=prepared_model.state_dict())
 
     def test_finalize_before_prepare(self, simple_model, basic_config):
         """

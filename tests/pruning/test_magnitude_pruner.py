@@ -734,9 +734,13 @@ class TestPrepareFromStateDict:
 
         torch.testing.assert_close(reloaded(example_input), expected, rtol=0, atol=0)
 
-    def test_resumes_schedule_mid_way(self, monkeypatch, linear_100x100_unique: nn.Linear) -> None:
-        """A model reloaded mid-schedule uses its saved masks and continues exactly like an
-        uninterrupted run."""
+    @pytest.mark.parametrize("load_after_prepare", [False, True])
+    def test_resumes_schedule_mid_way(
+        self, monkeypatch, linear_100x100_unique: nn.Linear, load_after_prepare: bool
+    ) -> None:
+        """A model reloaded mid-schedule, through ``prepare(state_dict=...)`` or by calling
+        ``load_state_dict`` after ``prepare``, uses its saved masks and continues exactly like
+        an uninterrupted run."""
         config = MagnitudePrunerConfig(
             global_config=ModuleMagnitudePrunerConfig(
                 op_state_spec={"weight": PruningSpec(target_sparsity=0.6)},
@@ -758,7 +762,11 @@ class TestPrepareFromStateDict:
 
         resumed = copy.deepcopy(linear_100x100_unique)
         resumed_pruner = MagnitudePruner(resumed, config)
-        resumed_pruner.prepare((example_input,), state_dict=saved)
+        if load_after_prepare:
+            resumed_pruner.prepare((example_input,))
+            resumed.load_state_dict(saved)
+        else:
+            resumed_pruner.prepare((example_input,), state_dict=saved)
         original_impl = uninterrupted.parametrizations["weight"][0]
         resumed_impl = resumed.parametrizations["weight"][0]
         assert resumed_pruner._step_count == 5
@@ -776,3 +784,19 @@ class TestPrepareFromStateDict:
             resumed_pruner.step()
             assert resumed_impl.sparsity == original_impl.sparsity
             assert torch.equal(resumed_impl.mask, original_impl.mask)
+
+    def test_reloads_into_other_dtype(self, linear_100x100_unique: nn.Linear) -> None:
+        """A mask loaded from a state dict saved in another dtype is cast to the weight's."""
+        example_input = torch.randn(1, 100)
+        source = copy.deepcopy(linear_100x100_unique)
+        MagnitudePruner(source).prepare((example_input,))
+
+        reloaded = copy.deepcopy(linear_100x100_unique).to(torch.bfloat16)
+        MagnitudePruner(reloaded).prepare(
+            (example_input.to(torch.bfloat16),), state_dict=source.state_dict()
+        )
+
+        assert reloaded(example_input.to(torch.bfloat16)).dtype == torch.bfloat16
+        reloaded_mask = reloaded.parametrizations["weight"][0].mask
+        assert reloaded_mask.dtype == torch.bfloat16
+        assert torch.equal(reloaded_mask, source.parametrizations["weight"][0].mask.bfloat16())

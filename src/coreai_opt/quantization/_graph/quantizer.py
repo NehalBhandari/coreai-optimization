@@ -1000,6 +1000,7 @@ class GraphQuantizer(_BaseQuantizer):
 
         Raises:
             RuntimeError: If the model has already been prepared.
+            RuntimeError: If ``state_dict`` does not match the prepared model.
             TypeError: If example_inputs is not a tuple.
             ValueError: If example_inputs is empty or contains invalid data.
         """
