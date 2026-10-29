@@ -14,8 +14,6 @@ from coreai_opt.pruning.config import (
     SparsityScheduleBase,
 )
 
-_PREV_SENTINEL = 42.0  # not equal to any computed schedule value in the tests below
-
 
 class TestConstantSparsitySchedule:
     """Tests for the constant (step-function) sparsity schedule."""
@@ -34,7 +32,7 @@ class TestConstantSparsitySchedule:
     ) -> None:
         """Returns 0 before begin_step and target at/after begin_step."""
         schedule = ConstantSparsitySchedule(begin_step=begin_step)
-        assert schedule.compute_sparsity(step_count, target, prev_sparsity=999.0) == expected
+        assert schedule.compute_sparsity(step_count, target) == expected
 
     def test_invalid_begin_step(self) -> None:
         """Negative begin_step raises ValueError."""
@@ -84,9 +82,9 @@ class TestPolynomialDecaySchedule:
                 0.5,
                 [
                     (0, 0.0),  # boundary at offset 0
-                    (3, _PREV_SENTINEL),  # off-boundary → passthrough of prev_sparsity
+                    (3, 0.0),  # off-boundary → holds the offset-0 value
                     (5, 0.5),  # boundary at offset 5 (i=1, t=1)
-                    (7, _PREV_SENTINEL),  # off-boundary → passthrough
+                    (7, 0.5),  # off-boundary → holds the offset-5 value
                     (10, 0.5),  # past schedule
                 ],
             ),
@@ -122,7 +120,7 @@ class TestPolynomialDecaySchedule:
         """Schedule values match the expected polynomial-decay formula."""
         schedule = PolynomialDecaySchedule(**kwargs)
         for step, expected in expected_at_steps:
-            actual = schedule.compute_sparsity(step, target, prev_sparsity=_PREV_SENTINEL)
+            actual = schedule.compute_sparsity(step, target)
             assert actual == pytest.approx(expected)
 
     @pytest.mark.parametrize(

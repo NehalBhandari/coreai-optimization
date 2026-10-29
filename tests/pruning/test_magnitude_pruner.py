@@ -754,8 +754,6 @@ class TestPrepareFromStateDict:
         uninterrupted = copy.deepcopy(linear_100x100_unique)
         pruner = MagnitudePruner(uninterrupted, config)
         pruner.prepare((example_input,))
-        # Step 5 is off-boundary: its sparsity is the one from step 4, so restoring it
-        # requires replaying the schedule rather than evaluating step 5 alone.
         for _ in range(5):
             pruner.step()
         saved = copy.deepcopy(uninterrupted.state_dict())
@@ -784,6 +782,27 @@ class TestPrepareFromStateDict:
             resumed_pruner.step()
             assert resumed_impl.sparsity == original_impl.sparsity
             assert torch.equal(resumed_impl.mask, original_impl.mask)
+
+    @pytest.mark.parametrize("load_after_prepare", [False, True])
+    def test_rejects_mismatched_step_counts(self, load_after_prepare: bool) -> None:
+        """Loading a state dict whose pruning modules have different step counts raises."""
+        model = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 10))
+        example_input = torch.randn(1, 10)
+        source = copy.deepcopy(model)
+        pruner = MagnitudePruner(source)
+        pruner.prepare((example_input,))
+        pruner.step()
+        saved = source.state_dict()
+        saved["1.parametrizations.weight.0.step_count"] = torch.tensor(2)
+
+        reloaded = copy.deepcopy(model)
+        reloaded_pruner = MagnitudePruner(reloaded)
+        with pytest.raises(RuntimeError, match="same step_count"):
+            if load_after_prepare:
+                reloaded_pruner.prepare((example_input,))
+                reloaded.load_state_dict(saved)
+            else:
+                reloaded_pruner.prepare((example_input,), state_dict=saved)
 
     def test_reloads_into_other_dtype(self, linear_100x100_unique: nn.Linear) -> None:
         """A mask loaded from a state dict saved in another dtype is cast to the weight's."""

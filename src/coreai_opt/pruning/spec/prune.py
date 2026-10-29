@@ -81,10 +81,7 @@ class PruneImplBase(CompressionSimulatorBase):
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
         if self.schedule is not None:
-            # Replayed from step 0, since off-boundary steps of some schedules reuse the
-            # previous sparsity. Fine for a one-off restore.
-            for step in range(int(self.step_count) + 1):
-                self.update_sparsity(step)
+            self.update_sparsity(int(self.step_count))
         if mask_key in state_dict and self.mask.numel() > 0:
             # A loaded mask is current, this prevents it from being recomputed during forward pass
             self._dirty = False
@@ -125,7 +122,7 @@ class PruneImplBase(CompressionSimulatorBase):
             raise RuntimeError(
                 "update_sparsity called on a PruneImplBase with no schedule attached."
             )
-        new = self.schedule.compute_sparsity(step_count, self._target_sparsity, self._sparsity)
+        new = self.schedule.compute_sparsity(step_count, self._target_sparsity)
         if new != self._sparsity:
             self._sparsity = new
             self._dirty = True

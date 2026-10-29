@@ -137,6 +137,7 @@ class MagnitudePruner(_BasePruner, _EagerCompressionComponentBuilderMixin):
         self._mark_model_as_prepared(prepared_model)
         self._model = prepared_model
         self._prune_impls = [m for m in prepared_model.modules() if isinstance(m, PruneImplBase)]
+        prepared_model.register_load_state_dict_post_hook(self._check_step_counts_match)
         self._build_scheduled_modules()
         for entry in self._scheduled_modules:
             entry.impl.update_sparsity(self._step_count)
@@ -229,6 +230,16 @@ class MagnitudePruner(_BasePruner, _EagerCompressionComponentBuilderMixin):
                 self._scheduled_modules.append(
                     _ScheduledModule(impl=impl, module=module, param_name=param_name)
                 )
+
+    @staticmethod
+    def _check_step_counts_match(model: torch.nn.Module, incompatible_keys: Any) -> None:
+        """Raise if a loaded state dict leaves the pruning modules with different step counts."""
+        step_counts = {int(m.step_count) for m in model.modules() if isinstance(m, PruneImplBase)}
+        if len(step_counts) > 1:
+            raise RuntimeError(
+                "All pruning modules must have the same step_count, but the loaded state dict "
+                f"has {sorted(step_counts)}."
+            )
 
     def _uninitialized_compression_modules(self, model: torch.nn.Module) -> list[str]:
         """Return the pruning modules whose mask is still empty."""

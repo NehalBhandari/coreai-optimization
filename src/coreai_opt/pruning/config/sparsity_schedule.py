@@ -28,7 +28,6 @@ class SparsityScheduleBase(BaseModel, _ConfigRegistryMixin):
         self,
         step_count: int,
         target_sparsity: float,
-        prev_sparsity: float | None = None,
     ) -> float:
         """Return the sparsity that should be applied at *step_count*.
 
@@ -37,10 +36,6 @@ class SparsityScheduleBase(BaseModel, _ConfigRegistryMixin):
                 (monotonically increasing).
             target_sparsity (float): The final sparsity we want to reach at the
                 end of the pruning schedule.
-            prev_sparsity (float | None): Sparsity from the previous invocation.
-                Schedules that don't need this can ignore it; schedules that do
-                (e.g. ``PolynomialDecaySchedule`` with an ``update_frequency``
-                gap) raise ``ValueError`` when omitted.
 
         Returns:
             float: The sparsity level to apply at the current step.
@@ -62,7 +57,6 @@ class ConstantSparsitySchedule(SparsityScheduleBase):
         self,
         step_count: int,
         target_sparsity: float,
-        prev_sparsity: float | None = None,
     ) -> float:
         return target_sparsity if step_count >= self.begin_step else 0.0
 
@@ -109,20 +103,12 @@ class PolynomialDecaySchedule(SparsityScheduleBase):
         self,
         step_count: int,
         target_sparsity: float,
-        prev_sparsity: float | None = None,
     ) -> float:
         if step_count < self.begin_step:
             return self.initial_sparsity
         if step_count >= self.begin_step + self.total_iters:
             return target_sparsity
         offset = step_count - self.begin_step
-        if offset % self.update_frequency != 0:
-            if prev_sparsity is None:
-                raise ValueError(
-                    "prev_sparsity is required for off-boundary steps when "
-                    f"update_frequency={self.update_frequency} > 1."
-                )
-            return prev_sparsity
         n_updates = max((self.total_iters - 1) // self.update_frequency + 1, 1)
         i = offset // self.update_frequency
         t = i / max(n_updates - 1, 1)
