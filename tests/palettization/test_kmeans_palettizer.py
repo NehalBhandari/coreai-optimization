@@ -33,6 +33,7 @@ from coreai_opt.palettization.spec import (
 from coreai_opt.palettization.spec.errors import _IncompatibleGranularityError
 from coreai_opt.palettization.spec.fake_palettize import _FakePalettizeImplBase
 from coreai_opt.quantization.spec import QuantizationScheme, QuantizationSpec
+from tests.models.simple import SimpleModel
 from tests.utils import spy_cluster_weights
 
 
@@ -417,19 +418,25 @@ class TestKMeansPalettizer:
         assert output.shape == (1, 10)
 
     def test_finalize_torch_backend(self, simple_conv_linear_model, simple_model_input):
+        """Torch finalize folds palettized weights, matches the prepared output, and
+        strict-loads into a fresh model."""
         palettizer = KMeansPalettizer(simple_conv_linear_model)
 
         prepared_model = palettizer.prepare(example_inputs=(simple_model_input,))
 
         prepared_output = prepared_model(simple_model_input)
 
-        finalized_model = palettizer.finalize(backend=ExportBackend._TORCH)
+        finalized_model = palettizer.finalize(backend=ExportBackend.Torch)
 
-        assert finalized_model is not None
+        assert not any(is_parametrized(m) for m in finalized_model.modules())
 
         finalized_output = finalized_model(simple_model_input)
 
         torch.testing.assert_close(finalized_output, prepared_output)
+
+        fresh_model = SimpleModel()
+        fresh_model.load_state_dict(finalized_model.state_dict(), strict=True)
+        torch.testing.assert_close(fresh_model(simple_model_input), prepared_output)
 
     def test_finalize_mil_backend(self, simple_conv_linear_model, simple_model_input):
         palettizer = KMeansPalettizer(simple_conv_linear_model)
@@ -462,7 +469,7 @@ class TestKMeansPalettizer:
 
     @pytest.mark.parametrize(
         "backend",
-        [ExportBackend._TORCH, ExportBackend.CoreML],
+        [ExportBackend.Torch, ExportBackend.CoreML],
     )
     def test_finalize_mmap_value_error_unsupported_backend(
         self, simple_conv_linear_model, simple_model_input, basic_config, tmp_path, backend
@@ -483,14 +490,14 @@ class TestKMeansPalettizer:
 
     @pytest.mark.parametrize(
         "backend",
-        [ExportBackend._TORCH, ExportBackend.CoreAI, ExportBackend.CoreML],
+        [ExportBackend.Torch, ExportBackend.CoreAI, ExportBackend.CoreML],
     )
     def test_finalize_weight_parametrization_state_per_backend(
         self, backend, simple_conv_linear_model, simple_model_input, basic_config
     ):
         """Post-finalize parametrization state is backend-specific:
 
-        - _TORCH: parametrization preserved with dense ``.original`` intact
+        - Torch: parametrization folded into a dense weight
         - CoreAI: parametrization replaced with palettize module; ``.original``
           cleared to a zero-size placeholder
         - CoreML: parametrization removed entirely
@@ -499,13 +506,14 @@ class TestKMeansPalettizer:
             simple_conv_linear_model, basic_config, simple_model_input, None, backend
         )
 
+        assert not KMeansPalettizer._is_model_prepared(finalized)
         weight_modules = [m for m in finalized.modules() if isinstance(m, (nn.Conv2d, nn.Linear))]
         assert weight_modules, "fixture regressed: no Conv2d/Linear to check"
 
-        if backend is ExportBackend._TORCH:
+        if backend is ExportBackend.Torch:
             for m in weight_modules:
-                assert P.is_parametrized(m, "weight")
-                assert m.parametrizations["weight"].original.numel() > 0
+                assert not P.is_parametrized(m, "weight")
+                assert m.weight.numel() > 0
         elif backend is ExportBackend.CoreAI:
             for m in weight_modules:
                 assert P.is_parametrized(m, "weight")

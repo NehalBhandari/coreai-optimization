@@ -386,8 +386,8 @@ def sparsify_weights(
             sparse_tensor = _build_sparse_with_bitmask(
                 values=nonzero_data_const,
                 bitmask=mask,
-            )._to_mlir()
-            compressed_weight = _sparse_with_bitmask_to_dense(sparse_tensor)._to_mlir()
+            )
+            compressed_weight = _sparse_with_bitmask_to_dense(sparse_tensor)
 
             if require_dequantization:
                 compressed_weight = _blockwise_shift_scale(

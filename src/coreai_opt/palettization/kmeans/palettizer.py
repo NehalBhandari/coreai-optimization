@@ -29,6 +29,7 @@ from coreai_opt._utils.insertion.torch_function import (
 )
 from coreai_opt._utils.spec_utils import PartialConstructor as _PartialConstructor
 from coreai_opt._utils.torch_utils import (
+    fold_compression_parametrizations as _fold_compression_parametrizations,
     move_model_to_train as _move_model_to_train,
     remove_compression_parametrizations as _remove_compression_parametrizations,
 )
@@ -45,6 +46,7 @@ from coreai_opt.palettization.config.palettization_config import (
 from coreai_opt.palettization.spec.fake_palettize import (
     _disable_fake_palett,
     _enable_fake_palett,
+    _FakePalettizeImplBase,
 )
 
 from ._prepare_for_export import (
@@ -459,15 +461,15 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
     ) -> torch.nn.Module:
         """Convert palettized model to backend-specific representations.
 
-        Only call ``finalize`` when exporting to a target backend. For torch-based
-        evaluation, use the model returned by ``prepare()`` directly rather than
-        calling ``finalize``.
+        Use ``backend=ExportBackend.Torch`` for fast torch inference (e.g. running
+        evals): palettized weights are folded into dense weights, so the model no
+        longer reconstructs them from the LUT on every forward pass.
 
         Args:
             model (nn.Module | None): Model to finalize. If None, uses the
                 internal prepared model.
-            backend (ExportBackend): Target export backend for the palettized
-                model. Supports CoreAI (default) and CoreML backends.
+            backend (ExportBackend): Target backend for the palettized model.
+                Supports CoreAI (default), CoreML and Torch backends.
             mmap_dir (str | None): If provided, finalized palettized weights are
                 written under this directory and re-loaded as mmap-backed
                 tensors so they don't have to be held in RAM. Only supported
@@ -500,8 +502,8 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
 
         # Backend-specific processing
         match backend:
-            case ExportBackend._TORCH:
-                pass
+            case ExportBackend.Torch:
+                _fold_compression_parametrizations(finalized_model, _FakePalettizeImplBase)
 
             case ExportBackend.CoreAI:
                 finalized_model = _prepare_for_mlir_export(finalized_model, mmap_dir=mmap_dir)
@@ -513,10 +515,7 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
                 msg = f"Unsupported backend: {backend}"
                 raise NotImplementedError(msg)
 
-        # Clear the prepared flag so the finalized model can be further processed
-        # (e.g., by Quantizer for activation quantization after weight palettization)
-        if hasattr(finalized_model, "_coreai_opt_prepared"):
-            delattr(finalized_model, "_coreai_opt_prepared")
+        self._unmark_model_as_prepared(finalized_model)
 
         return finalized_model
 

@@ -137,7 +137,6 @@ def _import_coreai() -> tuple:
         DebugInfo,
         TensorType,
         blockwise_shift_scale,
-        build_sparse_with_bitmask,
         cast as authoring_cast,
         float4_e2m1fn,
         float8_e4m3fn,
@@ -146,12 +145,15 @@ def _import_coreai() -> tuple:
         float16,
         float32,
         lut_to_dense,
-        sparse_with_bitmask_to_dense,
     )
     from coreai.authoring.constant import constant as authoring_constant  # noqa: PLC0415
     # isort: on
 
     from coreai._compiler.dialects import coreai as coreai_dialect  # noqa: PLC0415
+    from coreai._compiler.dialects.coreai import (  # noqa: PLC0415
+        build_sparse_with_bitmask,
+        sparse_with_bitmask_to_dense,
+    )
     from coreai._compiler.dialects.coreai.constant import create_elements_attr  # noqa: PLC0415
     from coreai._compiler.ir import (  # noqa: PLC0415
         BoolAttr,

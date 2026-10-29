@@ -337,7 +337,7 @@ class TestEagerQuantizer:
 
         assert quantizer._is_model_prepared(copied_prepared_model)
 
-        finalized_model = quantizer.finalize(copied_prepared_model, ExportBackend._TORCH)
+        finalized_model = quantizer.finalize(copied_prepared_model, ExportBackend.Torch)
 
         output = finalized_model(example_input)
         assert output.shape == (1, 10)
@@ -363,7 +363,7 @@ class TestEagerQuantizer:
         prepared_b = quantizer_b.prepare((example_input,))
         prepared_b.load_state_dict(saved_state_dict)
 
-        finalized_b = quantizer_b.finalize(prepared_b, ExportBackend._TORCH)
+        finalized_b = quantizer_b.finalize(prepared_b, ExportBackend.Torch)
         actual_output = finalized_b(example_input)
 
         assert torch.allclose(expected_output, actual_output)
@@ -381,27 +381,28 @@ class TestEagerQuantizer:
 
     @pytest.mark.parametrize(
         "backend",
-        [ExportBackend._TORCH, ExportBackend.CoreAI, ExportBackend.CoreML],
+        [ExportBackend.Torch, ExportBackend.CoreAI, ExportBackend.CoreML],
     )
     def test_finalize_weight_parametrization_state_per_backend(
         self, backend, simple_model, basic_config, example_input
     ):
         """Post-finalize parametrization state is backend-specific:
 
-        - _TORCH: parametrization preserved with dense ``.original`` intact
+        - Torch: parametrization folded into a dense weight
         - CoreAI: parametrization replaced with dequantize module; ``.original``
           cleared to a zero-size placeholder
         - CoreML: parametrization removed entirely
         """
         finalized = self._quantize_model(simple_model, basic_config, example_input, None, backend)
 
+        assert not Quantizer._is_model_prepared(finalized)
         weight_modules = [m for m in finalized.modules() if isinstance(m, (nn.Conv2d, nn.Linear))]
         assert weight_modules, "fixture regressed: no Conv2d/Linear to check"
 
-        if backend is ExportBackend._TORCH:
+        if backend is ExportBackend.Torch:
             for m in weight_modules:
-                assert is_parametrized(m, "weight")
-                assert m.parametrizations["weight"].original.numel() > 0
+                assert not is_parametrized(m, "weight")
+                assert m.weight.numel() > 0
         elif backend is ExportBackend.CoreAI:
             for m in weight_modules:
                 assert is_parametrized(m, "weight")
@@ -410,6 +411,47 @@ class TestEagerQuantizer:
             for m in weight_modules:
                 assert not is_parametrized(m, "weight")
                 assert m.weight.numel() > 0
+
+    def test_finalize_torch_matches_prepared_and_keeps_activation_fq(
+        self, simple_model, basic_config, example_input
+    ):
+        """Torch finalize folds weight fake quantization, keeps activation fake
+        quantization, and produces the prepared model's output."""
+        quantizer = Quantizer(simple_model, basic_config)
+        prepared_model = quantizer.prepare((example_input,))
+        expected_output = prepared_model(example_input)
+
+        finalized = quantizer.finalize(backend=ExportBackend.Torch)
+
+        assert not any(is_parametrized(m) for m in finalized.modules())
+        assert any(isinstance(m, FakeQuantizeImplBase) for m in finalized.modules()), (
+            "activation fake quantization must be kept"
+        )
+        torch.testing.assert_close(finalized(example_input), expected_output)
+
+    def test_finalize_torch_state_dict_loads_into_original_model(
+        self, simple_model, weight_only_config, example_input
+    ):
+        """A weight-only Torch-finalized state dict strict-loads into a fresh original model."""
+        quantizer = Quantizer(simple_model, weight_only_config)
+        quantizer.prepare((example_input,))
+        finalized = quantizer.finalize(backend=ExportBackend.Torch)
+
+        fresh_model = SimpleModel()
+        fresh_model.load_state_dict(finalized.state_dict(), strict=True)
+        torch.testing.assert_close(fresh_model(example_input), finalized(example_input))
+
+    def test_finalize_torch_keeps_weight_tie(self, weight_only_config):
+        """Tied weights sharing a fake quantizer fold into one shared tensor."""
+        example_input = torch.randn(2, 4)
+        quantizer = Quantizer(SharedWeightModel(), weight_only_config)
+        prepared_model = quantizer.prepare((example_input,))
+        expected_output = prepared_model(example_input)
+
+        finalized = quantizer.finalize(backend=ExportBackend.Torch)
+
+        assert finalized.linear1.weight is finalized.linear2.weight
+        torch.testing.assert_close(finalized(example_input), expected_output)
 
     def test_calibration_mode(self, simple_model, basic_config, example_input):
         """
@@ -2985,7 +3027,7 @@ class TestEagerHalfPrecisionSupport:
     @pytest.mark.parametrize(
         "backend",
         [
-            pytest.param(ExportBackend._TORCH, id="torch"),
+            pytest.param(ExportBackend.Torch, id="torch"),
             pytest.param(ExportBackend.CoreAI, id="coreai"),
             pytest.param(ExportBackend.CoreML, id="coreml"),
         ],
@@ -3012,7 +3054,7 @@ class TestEagerHalfPrecisionSupport:
 
         finalized_model = quantizer.finalize(backend=backend)
         if model_dtype == torch.float32 or backend in [
-            ExportBackend._TORCH,
+            ExportBackend.Torch,
             ExportBackend.CoreAI,
         ]:
             output = finalized_model(input_tensor)
