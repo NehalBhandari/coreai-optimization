@@ -1721,7 +1721,7 @@ class TestKMeansPalettizerLoadFromStateDict:
         with torch.no_grad():
             got = loaded(simple_model_input)
 
-        # Reloaded state is exact; outputs may differ in the last ulp across kernel runs.
+        # Reloaded state is exact; outputs may differ slightly
         torch.testing.assert_close(loaded.state_dict(), prepared.state_dict(), rtol=0, atol=0)
         torch.testing.assert_close(got, expected)
 

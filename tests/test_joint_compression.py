@@ -116,6 +116,6 @@ def test_p4a8_reload_each_stage_from_state_dict(
     original, palett_saved, quant_saved = compress()
     reloaded, _, _ = compress(palett_saved, quant_saved)
 
-    # Reloaded state is exact; outputs may differ in the last ulp across kernel runs.
+    # Reloaded state is exact; outputs may differ slightly
     torch.testing.assert_close(reloaded.state_dict(), original.state_dict(), rtol=0, atol=0)
     torch.testing.assert_close(reloaded(example_input), original(example_input))
