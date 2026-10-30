@@ -159,7 +159,8 @@ from coreai_opt.quantization import Quantizer
 # First run: compress, saving a checkpoint after each stage.
 palettizer = KMeansPalettizer(copy.deepcopy(model), palett_config)
 palettized = palettizer.prepare(example_inputs)
-torch.save(palettized.state_dict(), "palettized.pt")  # before finalize(), which modifies the model
+# Save before finalize(), which modifies the model.
+torch.save(palettized.state_dict(), "palettized.pt")
 palettized_model = palettizer.finalize(backend=opt.ExportBackend.CoreAI)
 
 quantizer = Quantizer(palettized_model, quant_config)
