@@ -32,11 +32,11 @@ val_metric = validate(prepared_model, val_dataset)
 finalized_model_for_coreai = palettizer.finalize(backend=opt.ExportBackend.CoreAI)
 # OR
 finalized_model_for_coreml = palettizer.finalize(backend=opt.ExportBackend.CoreML)
-# OR, for fast inference in PyTorch (e.g. evaluation)
+# OR, to run evaluations in PyTorch
 finalized_model_for_torch = palettizer.finalize(backend=opt.ExportBackend.Torch)
 ```
 
-See [Fast inference in PyTorch](../introduction/torch_backend.md) for when to use the Torch backend, and [Checkpoints and workflows](../introduction/checkpoints.md) for how to reload a prepared model to finalize it for more than one backend.
+See [Running PyTorch evaluations with compressed models](../introduction/torch_backend.md) for when to use the Torch backend, and [Checkpoints and workflows](../introduction/checkpoints.md) for how to reload a prepared model to finalize it for more than one backend.
 
 ## Sensitive K-means API
 

@@ -1,8 +1,10 @@
-# Fast inference in PyTorch
+# Running PyTorch evaluations with compressed models
 
-A prepared model applies compression on the fly: on every forward pass, each compressed weight is reconstructed from its compression state (for example, the palettization LUT and indices, the quantization scales, or the pruning mask). That keeps the model ready for calibration and training, but it makes inference slow, especially for large models.
+Compressing a model with coreai-opt starts with [`prepare()`](how_to_use_coreaiopt.md#prepare), which inserts compression into the model, optionally followed by calibration or training. The resulting prepared model is ready to be evaluated or exported. [`finalize()`](how_to_use_coreaiopt.md#finalize) converts it into a finalized model for the target backend selected by its `backend` argument. This page covers `ExportBackend.Torch`, which finalizes the model for running evaluations of the compressed model in PyTorch.
 
-`finalize(backend=opt.ExportBackend.Torch)` computes each compressed weight once and folds it into a dense weight. Activation fake quantization is kept, so the finalized model produces the same outputs as the prepared model, while running much faster.
+A prepared model applies compression on the fly: on every forward pass, each compressed weight is reconstructed from its compression state (for example, the palettization LUT and indices, the quantization scales, or the pruning mask). That keeps the model ready for calibration and training, but makes its forward pass slower than the uncompressed model's, especially for large models.
+
+`finalize(backend=opt.ExportBackend.Torch)` folds (decompresses) each compressed weight once into a dense weight. Activation fake quantization is kept, so the finalized model produces the same outputs as the prepared model, and runs at similar latency to the uncompressed model.
 
 ```python
 import coreai_opt as opt

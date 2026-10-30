@@ -1,9 +1,9 @@
 # Checkpoints and workflows
 
-A prepared model can be saved as a checkpoint and reloaded later, with its compression state intact. For example, you can use a checkpoint to:
+A prepared model, the model returned by a compressor's [`prepare()`](how_to_use_coreaiopt.md#prepare), holds the compression state, such as palettization centroids, quantization parameters, or pruning masks. It can be saved as a checkpoint and reloaded later, with its compression state intact. For example, you can use a checkpoint to:
 
 - Keep the results of expensive compression steps, such as k-means clustering, calibration, or training, and continue from them later instead of redoing them.
-- Prepare and calibrate or train a model on one machine, and finalize and export it on another.
+- Prepare and calibrate or train a model on one machine, and [finalize](how_to_use_coreaiopt.md#finalize) and export it on another.
 - Finalize the same compressed model for more than one backend, for example to evaluate it with the [Torch backend](torch_backend.md) and then export it to [Core AI](integration_coreai.md).
 
 This page covers how to checkpoint and reload a prepared model, and shows workflows that use checkpoints.
@@ -73,7 +73,8 @@ torch.save(prepared_model.state_dict(), "prepared.pt")
 
 # 2. Evaluate with the Torch backend.
 eval_model = palettizer.finalize(backend=opt.ExportBackend.Torch)
-evaluate(eval_model.eval())
+eval_model.eval()
+evaluate(eval_model)
 
 # 3. Reload the checkpoint, without re-running k-means, and finalize for Core AI.
 state_dict = torch.load("prepared.pt")
@@ -141,9 +142,9 @@ for epoch in range(4, num_epochs):
     pruner.step()
 ```
 
-### Checkpoint and reload a palettized and activation-quantized (P4A8) model
+### Evaluate a palettized and activation-quantized (P4A8) model with the Torch backend, then export to Core AI
 
-[Joint compression](../utils/joint_compression.md) applies two compressors in sequence: palettize the weights, finalize the palettizer, then quantize and calibrate the activations. Save a checkpoint after each stage, then rebuild the compressed model by reloading the stages in the same order, without re-running k-means or calibration:
+[Joint compression](../utils/joint_compression.md) applies two compressors in sequence: palettize the weights, finalize the palettizer, then quantize and calibrate the activations. To evaluate the P4A8 model at similar latency to the uncompressed model, finalize the palettizer for the Torch backend. Save a checkpoint of the palettizer before finalizing it, and reload it to export the same palettized model to Core AI, without re-running k-means:
 
 ```python
 import copy
@@ -156,31 +157,34 @@ from coreai_opt.quantization import Quantizer
 
 # palett_config and quant_config as in Joint Compression.
 
-# First run: compress, saving a checkpoint after each stage.
+# 1. Palettize once and save a checkpoint before finalizing.
 palettizer = KMeansPalettizer(copy.deepcopy(model), palett_config)
 palettized = palettizer.prepare(example_inputs)
-# Save before finalize(), which modifies the model.
 torch.save(palettized.state_dict(), "palettized.pt")
-palettized_model = palettizer.finalize(backend=opt.ExportBackend.CoreAI)
 
+# 2. Evaluate: finalize the palettizer for the Torch backend, then quantize and
+#    calibrate the activations, and finalize the quantizer for the Torch backend.
+palettized_model = palettizer.finalize(backend=opt.ExportBackend.Torch)
 quantizer = Quantizer(palettized_model, quant_config)
 prepared_model = quantizer.prepare(example_inputs)
 with quantizer.calibration_mode():
     for batch in calibration_dataloader:
         prepared_model(batch)
-torch.save(prepared_model.state_dict(), "quantized.pt")
+eval_model = quantizer.finalize(backend=opt.ExportBackend.Torch)
+eval_model.eval()
+evaluate(eval_model)
 
-# Later: rebuild the P4A8 model from the checkpoints.
-palett_state_dict = torch.load("palettized.pt")
+# 3. Export: reload the palettizer checkpoint, without re-running k-means, and
+#    finalize it for Core AI. Then quantize and calibrate the activations again.
 palettizer = KMeansPalettizer(copy.deepcopy(model), palett_config)
-palettizer.prepare(example_inputs, state_dict=palett_state_dict)
+palettizer.prepare(example_inputs, state_dict=torch.load("palettized.pt"))
 palettized_model = palettizer.finalize(backend=opt.ExportBackend.CoreAI)
-
-quant_state_dict = torch.load("quantized.pt")
 quantizer = Quantizer(palettized_model, quant_config)
-prepared_model = quantizer.prepare(example_inputs, state_dict=quant_state_dict)
-
+prepared_model = quantizer.prepare(example_inputs)
+with quantizer.calibration_mode():
+    for batch in calibration_dataloader:
+        prepared_model(batch)
 coreai_model = quantizer.finalize(backend=opt.ExportBackend.CoreAI)
 ```
 
-Two checkpoints are needed because the quantizer's checkpoint is taken on the palettizer's finalized model: reloading it requires rebuilding that model first, by preparing and finalizing the palettizer. Without its own checkpoint, `palettizer.prepare()` would re-run k-means on the original weights, only for the result to be overwritten by the palettized weights stored in the quantizer's checkpoint. For the same reason, finalize the palettizer for the same backend in both runs. The reloaded `prepared_model` is calibrated and ready to finalize for Core AI.
+The activations are calibrated again for export, because the evaluation run's checkpoint can't be passed to `quantizer.prepare(state_dict=...)` on the export path: its activation quantization state is the same, but its palettized weights are stored as dense weights, while the Core AI-finalized palettizer stores them as LUT and index buffers. Calibrating with the same data produces the same quantization parameters, so the exported model matches the evaluated one. Convert `coreai_model` as described in [Integration with Core AI](integration_coreai.md).
