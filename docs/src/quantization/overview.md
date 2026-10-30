@@ -23,7 +23,7 @@ prepared_model = quantizer.prepare(example_inputs)
 val_metric = validate(prepared_model, val_dataset)
 ```
 
-When the accuracy is acceptable, call `finalize()` for the target backend, then convert.
+When the accuracy is acceptable, call `finalize()` for the target backend, then convert. To evaluate a large model faster, finalize a checkpointed copy for `ExportBackend.Torch`; see [Fast inference in PyTorch](../introduction/torch_backend.md) and [Checkpoints and workflows](../introduction/checkpoints.md).
 
 Core AI (`.aimodel`):
 
